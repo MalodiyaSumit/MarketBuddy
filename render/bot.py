@@ -11,6 +11,7 @@ import io
 from datetime import datetime
 from flask import Flask
 import threading
+import pytz
 
 # Setup logging first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,6 +28,14 @@ API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Flag to prevent multiple bot instances
 bot_started = False
+
+# Indian Timezone
+IST = pytz.timezone('Asia/Kolkata')
+
+# Track last sent alerts to avoid duplicates
+last_news_check = 0
+last_scheduled_alert = {}
+sent_news_ids = set()
 
 # Indian Indices
 INDIAN_INDICES = {
@@ -527,6 +536,260 @@ def handle_portfolio(chat_id, action=None, symbol=None, qty=None, price=None):
         msg += f"*Total P/L:* Rs {total_pnl:+,.2f}"
         send_message(chat_id, msg)
 
+# ===== AUTOMATIC ALERTS =====
+
+def send_market_summary_auto():
+    """Send automatic market summary with indices and watchlist"""
+    now = datetime.now(IST)
+
+    msg = f"""📊 *AUTOMATIC MARKET UPDATE*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*INDICES:*
+"""
+    # Get indices
+    for idx in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+        data = get_index_data(idx)
+        if data:
+            emoji = "📈" if data.get('change', 0) >= 0 else "📉"
+            msg += f"{emoji} *{idx}*: {data.get('value', 0):,.2f} ({data.get('pct', 0):+.2f}%)\n"
+
+    msg += "\n*YOUR WATCHLIST:*\n"
+
+    # Get watchlist prices
+    for sym in DEFAULT_WATCHLIST:
+        try:
+            info = get_stock_info(sym)
+            if info and info.get('price'):
+                price = info['price']
+                prev = info.get('previous_close', price)
+                pct = ((price - prev) / prev * 100) if prev else 0
+                emoji = "📈" if pct >= 0 else "📉"
+                msg += f"{emoji} *{sym}*: ₹{price:,.2f} ({pct:+.2f}%)\n"
+        except:
+            pass
+
+    send_message(ADMIN_CHAT_ID, msg)
+    logger.info("Auto market summary sent")
+
+
+def send_market_open_alert():
+    """Send alert when market opens"""
+    msg = """🔔 *MARKET OPEN ALERT*
+
+Indian Stock Market is NOW OPEN! 🟢
+
+Trading Hours: 9:15 AM - 3:30 PM IST
+
+Good luck with your trades today!"""
+    send_message(ADMIN_CHAT_ID, msg)
+    logger.info("Market open alert sent")
+
+
+def send_market_close_alert():
+    """Send alert when market closes with full summary"""
+    now = datetime.now(IST)
+
+    msg = f"""🔔 *MARKET CLOSED*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+Indian Stock Market is NOW CLOSED! 🔴
+
+*TODAY'S SUMMARY:*
+
+"""
+    # Get indices
+    for idx in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+        data = get_index_data(idx)
+        if data:
+            emoji = "📈" if data.get('change', 0) >= 0 else "📉"
+            msg += f"{emoji} *{idx}*: {data.get('value', 0):,.2f} ({data.get('pct', 0):+.2f}%)\n"
+
+    msg += "\n*WATCHLIST PERFORMANCE:*\n"
+
+    for sym in DEFAULT_WATCHLIST:
+        try:
+            info = get_stock_info(sym)
+            if info and info.get('price'):
+                price = info['price']
+                prev = info.get('previous_close', price)
+                pct = ((price - prev) / prev * 100) if prev else 0
+                emoji = "📈" if pct >= 0 else "📉"
+                msg += f"{emoji} *{sym}*: ₹{price:,.2f} ({pct:+.2f}%)\n"
+        except:
+            pass
+
+    msg += "\nSee you tomorrow! 👋"
+    send_message(ADMIN_CHAT_ID, msg)
+    logger.info("Market close alert sent")
+
+
+def check_breaking_news():
+    """Check for important breaking news and send alerts"""
+    global sent_news_ids
+
+    try:
+        # Important keywords for Indian market
+        keywords = ["RBI", "SEBI", "Sensex", "Nifty", "crash", "surge", "breaking",
+                   "Fed", "interest rate", "inflation", "GDP", "recession",
+                   "Reliance", "TCS", "HDFC", "Infosys", "budget", "tax"]
+
+        articles = get_market_news(limit=10)
+
+        for article in articles:
+            title = article.get('title', '')
+            description = article.get('description', '')
+            url = article.get('url', '')
+
+            # Create unique ID
+            news_id = hash(title)
+
+            # Skip if already sent
+            if news_id in sent_news_ids:
+                continue
+
+            # Check if important
+            content = (title + " " + description).lower()
+            is_important = any(kw.lower() in content for kw in keywords)
+
+            if is_important:
+                msg = f"""🚨 *BREAKING NEWS ALERT*
+
+*{title}*
+
+{description[:200] if description else ''}...
+
+_Source: {article.get('source', {}).get('name', 'Unknown')}_"""
+
+                send_message(ADMIN_CHAT_ID, msg)
+                sent_news_ids.add(news_id)
+                logger.info(f"Breaking news sent: {title[:50]}")
+
+                # Keep only last 100 news IDs
+                if len(sent_news_ids) > 100:
+                    sent_news_ids = set(list(sent_news_ids)[-50:])
+
+                # Only send one news at a time
+                break
+
+    except Exception as e:
+        logger.error(f"Breaking news check error: {e}")
+
+
+def check_strong_signals():
+    """Check watchlist for strong buy/sell signals"""
+    try:
+        strong_alerts = []
+
+        for sym in DEFAULT_WATCHLIST:
+            df = get_stock_data(sym, period="1mo")
+            if df is None:
+                continue
+
+            analysis = analyze_stock(df)
+            if not analysis:
+                continue
+
+            # Only alert on STRONG signals (strength >= 3 or <= -3)
+            strength = analysis.get('strength', 0)
+            signal = analysis.get('signal', '')
+
+            if strength >= 3:  # Strong Buy
+                info = get_stock_info(sym)
+                price = info.get('price', 0) if info else 0
+                strong_alerts.append({
+                    'symbol': sym,
+                    'signal': '🟢 STRONG BUY',
+                    'price': price,
+                    'rsi': analysis.get('rsi', 0),
+                    'strength': strength
+                })
+            elif strength <= -3:  # Strong Sell
+                info = get_stock_info(sym)
+                price = info.get('price', 0) if info else 0
+                strong_alerts.append({
+                    'symbol': sym,
+                    'signal': '🔴 STRONG SELL',
+                    'price': price,
+                    'rsi': analysis.get('rsi', 0),
+                    'strength': strength
+                })
+
+        if strong_alerts:
+            msg = "🚨 *STRONG SIGNAL ALERT*\n\n"
+            for alert in strong_alerts[:3]:  # Max 3 alerts
+                msg += f"""*{alert['symbol']}* - {alert['signal']}
+  Price: ₹{alert['price']:,.2f}
+  RSI: {alert['rsi']:.1f}
+  Strength: {alert['strength']}
+
+"""
+            msg += "_This is not financial advice. Do your own research._"
+            send_message(ADMIN_CHAT_ID, msg)
+            logger.info(f"Strong signals alert sent: {len(strong_alerts)} stocks")
+
+    except Exception as e:
+        logger.error(f"Strong signals check error: {e}")
+
+
+def run_scheduler():
+    """Background scheduler for automatic alerts"""
+    global last_scheduled_alert
+
+    logger.info("Scheduler started!")
+
+    while True:
+        try:
+            now = datetime.now(IST)
+            current_hour = now.hour
+            current_minute = now.minute
+            current_day = now.weekday()  # 0=Monday, 6=Sunday
+            today_key = now.strftime('%Y-%m-%d')
+
+            # Skip weekends
+            if current_day >= 5:  # Saturday or Sunday
+                time.sleep(60)
+                continue
+
+            # Market Open Alert - 9:15 AM
+            if current_hour == 9 and current_minute == 15:
+                if last_scheduled_alert.get('market_open') != today_key:
+                    send_market_open_alert()
+                    last_scheduled_alert['market_open'] = today_key
+
+            # Morning Update - 10:30 AM
+            if current_hour == 10 and current_minute == 30:
+                if last_scheduled_alert.get('morning') != today_key:
+                    send_market_summary_auto()
+                    last_scheduled_alert['morning'] = today_key
+
+            # Afternoon Update - 1:30 PM (13:30)
+            if current_hour == 13 and current_minute == 30:
+                if last_scheduled_alert.get('afternoon') != today_key:
+                    send_market_summary_auto()
+                    last_scheduled_alert['afternoon'] = today_key
+
+            # Market Close Alert - 3:30 PM (15:30)
+            if current_hour == 15 and current_minute == 30:
+                if last_scheduled_alert.get('market_close') != today_key:
+                    send_market_close_alert()
+                    last_scheduled_alert['market_close'] = today_key
+
+            # Check breaking news every 10 minutes
+            if current_minute % 10 == 0:
+                check_breaking_news()
+
+            # Check strong signals every 30 minutes during market hours
+            if current_minute % 30 == 0 and 9 <= current_hour < 16:
+                check_strong_signals()
+
+            time.sleep(60)  # Check every minute
+
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+            time.sleep(60)
+
+
 # ===== BOT LOOP =====
 def run_bot():
     global bot_started
@@ -552,6 +815,11 @@ def run_bot():
         logger.info("Pending updates cleared")
     except:
         pass
+
+    # Start scheduler thread for automatic alerts
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    logger.info("Scheduler thread started!")
 
     offset = None
 

@@ -8,3 +8,4 @@ ta
 scikit-learn
 matplotlib
 mplfinance
+pytz

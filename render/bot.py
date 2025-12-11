@@ -1130,10 +1130,13 @@ def run_bot():
             logger.error(f"Loop error: {e}")
             time.sleep(5)
 
+# ===== START BOT THREAD =====
+# This runs when gunicorn imports the module
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
+logger.info("Bot thread started!")
+
 # ===== MAIN =====
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)

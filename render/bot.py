@@ -303,25 +303,43 @@ def generate_chart(symbol):
 
 # ===== HANDLERS =====
 def handle_start(chat_id, user_name):
-    msg = f"""*Welcome to MarketBuddy Pro!*
+    msg = f"""*Welcome to MarketBuddy!*
 
-Hello {user_name}!
+Hello {user_name}! I'm your personal stock analysis assistant.
 
-*COMMANDS:*
-/stock SYMBOL - Technical analysis
-/price SYMBOL - Quick price
-/chart SYMBOL - Price chart
-/summary - Market indices
-/news - Latest news
-/watchlist - Your watchlist
-/watchlist add SYMBOL
-/watchlist remove SYMBOL
-/portfolio - Your holdings
+*Available Commands:*
+
+/stock SYMBOL - Get detailed analysis
+  Example: /stock RELIANCE or /stock TCS
+
+/price SYMBOL - Quick price check
+
+/chart SYMBOL - Get price chart with RSI
+
+/summary - Get NIFTY & SENSEX summary
+
+/news - Get latest market news
+
+/watchlist - View your watchlist
+/watchlist add SYMBOL - Add stock
+/watchlist remove SYMBOL - Remove stock
+
+/portfolio - View your holdings
 /portfolio add SYMBOL QTY PRICE
-/alert SYMBOL PRICE - Set alert
-/alerts - View alerts
 
-Try: /stock RELIANCE"""
+/alert SYMBOL PRICE - Set price alert
+/alerts - View your alerts
+
+/help - Show this help message
+
+*Features:*
+  Technical Analysis (RSI, MACD, SMA, Bollinger)
+  Anomaly Detection
+  7-Day Price Forecast
+  Automatic Buy Alerts (every 5 min)
+  Daily Summary (8 AM)
+
+Start by typing `/stock RELIANCE` to see it in action!"""
     send_message(chat_id, msg)
 
 def handle_price(chat_id, symbol):
@@ -518,6 +536,22 @@ def run_bot():
 
     bot_started = True
     logger.info("MarketBuddy Pro starting...")
+
+    # Delete any existing webhook to ensure clean polling
+    try:
+        delete_webhook_url = f"{API_URL}/deleteWebhook"
+        requests.get(delete_webhook_url, timeout=10)
+        logger.info("Webhook deleted")
+    except:
+        pass
+
+    # Clear pending updates to avoid processing old messages
+    try:
+        clear_url = f"{API_URL}/getUpdates?offset=-1"
+        requests.get(clear_url, timeout=10)
+        logger.info("Pending updates cleared")
+    except:
+        pass
 
     offset = None
 

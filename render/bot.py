@@ -1010,11 +1010,19 @@ def send_market_summary():
 # ===== BOT LOOP =====
 def run_bot():
     logger.info("🚀 MarketBuddy Pro starting...")
-    send_message(ADMIN_CHAT_ID, "🚀 *MarketBuddy Pro Started!*\n\nAll features active.\nUse /start for help.")
+
+    # Try to send startup message, but don't crash if it fails
+    try:
+        send_message(ADMIN_CHAT_ID, "🚀 *MarketBuddy Pro Started!*\n\nAll features active.\nUse /start for help.")
+        logger.info("Startup message sent successfully")
+    except Exception as e:
+        logger.error(f"Failed to send startup message: {e}")
 
     offset = None
     last_alert_check = time.time()
     last_summary = time.time()
+
+    logger.info("Starting bot loop...")
 
     while True:
         try:
@@ -1022,82 +1030,90 @@ def run_bot():
 
             if updates and updates.get('ok'):
                 for update in updates.get('result', []):
-                    offset = update['update_id'] + 1
+                    try:
+                        offset = update['update_id'] + 1
 
-                    message = update.get('message', {})
-                    text = message.get('text', '').strip()
-                    chat_id = message.get('chat', {}).get('id')
-                    user_name = message.get('from', {}).get('first_name', 'User')
+                        message = update.get('message', {})
+                        text = message.get('text', '').strip()
+                        chat_id = message.get('chat', {}).get('id')
+                        user_name = message.get('from', {}).get('first_name', 'User')
 
-                    if not text or not chat_id:
-                        continue
+                        if not text or not chat_id:
+                            continue
 
-                    logger.info(f"Message from {user_name}: {text}")
-                    parts = text.split()
-                    cmd = parts[0].lower()
+                        logger.info(f"Message from {user_name}: {text}")
+                        parts = text.split()
+                        cmd = parts[0].lower()
 
-                    # Handle commands
-                    if cmd in ['/start', '/help']:
-                        handle_start(chat_id, user_name)
+                        # Handle commands
+                        if cmd in ['/start', '/help']:
+                            handle_start(chat_id, user_name)
 
-                    elif cmd == '/price' and len(parts) >= 2:
-                        handle_price(chat_id, parts[1])
+                        elif cmd == '/price' and len(parts) >= 2:
+                            handle_price(chat_id, parts[1])
 
-                    elif cmd == '/stock' and len(parts) >= 2:
-                        handle_stock(chat_id, parts[1])
+                        elif cmd == '/stock' and len(parts) >= 2:
+                            handle_stock(chat_id, parts[1])
 
-                    elif cmd == '/chart' and len(parts) >= 2:
-                        handle_chart(chat_id, parts[1])
+                        elif cmd == '/chart' and len(parts) >= 2:
+                            handle_chart(chat_id, parts[1])
 
-                    elif cmd == '/summary':
-                        handle_summary(chat_id)
+                        elif cmd == '/summary':
+                            handle_summary(chat_id)
 
-                    elif cmd == '/news':
-                        handle_news(chat_id)
+                        elif cmd == '/news':
+                            handle_news(chat_id)
 
-                    elif cmd == '/topgainers':
-                        handle_topgainers(chat_id)
+                        elif cmd == '/topgainers':
+                            handle_topgainers(chat_id)
 
-                    elif cmd == '/toplosers':
-                        handle_toplosers(chat_id)
+                        elif cmd == '/toplosers':
+                            handle_toplosers(chat_id)
 
-                    elif cmd == '/options':
-                        symbol = parts[1] if len(parts) >= 2 else "NIFTY"
-                        handle_options(chat_id, symbol)
+                        elif cmd == '/options':
+                            symbol = parts[1] if len(parts) >= 2 else "NIFTY"
+                            handle_options(chat_id, symbol)
 
-                    elif cmd == '/fii':
-                        handle_fii(chat_id)
+                        elif cmd == '/fii':
+                            handle_fii(chat_id)
 
-                    elif cmd == '/watchlist':
-                        if len(parts) >= 3 and parts[1].lower() == 'add':
-                            handle_watchlist(chat_id, 'add', parts[2])
-                        elif len(parts) >= 3 and parts[1].lower() == 'remove':
-                            handle_watchlist(chat_id, 'remove', parts[2])
+                        elif cmd == '/watchlist':
+                            if len(parts) >= 3 and parts[1].lower() == 'add':
+                                handle_watchlist(chat_id, 'add', parts[2])
+                            elif len(parts) >= 3 and parts[1].lower() == 'remove':
+                                handle_watchlist(chat_id, 'remove', parts[2])
+                            else:
+                                handle_watchlist(chat_id)
+
+                        elif cmd == '/alert' and len(parts) >= 3:
+                            handle_alert(chat_id, parts[1], parts[2])
+
+                        elif cmd == '/alerts':
+                            handle_alerts(chat_id)
+
+                        elif cmd == '/portfolio':
+                            if len(parts) >= 5 and parts[1].lower() == 'add':
+                                handle_portfolio(chat_id, 'add', parts[2], parts[3], parts[4])
+                            elif len(parts) >= 3 and parts[1].lower() == 'remove':
+                                handle_portfolio(chat_id, 'remove', parts[2])
+                            else:
+                                handle_portfolio(chat_id)
+
+                        elif cmd == '/screen' and len(parts) >= 2:
+                            handle_screen(chat_id, parts[1])
+
+                        elif cmd == '/compare' and len(parts) >= 3:
+                            handle_compare(chat_id, parts[1], parts[2])
+
                         else:
-                            handle_watchlist(chat_id)
+                            send_message(chat_id, "❓ Unknown command. Use /help")
 
-                    elif cmd == '/alert' and len(parts) >= 3:
-                        handle_alert(chat_id, parts[1], parts[2])
-
-                    elif cmd == '/alerts':
-                        handle_alerts(chat_id)
-
-                    elif cmd == '/portfolio':
-                        if len(parts) >= 5 and parts[1].lower() == 'add':
-                            handle_portfolio(chat_id, 'add', parts[2], parts[3], parts[4])
-                        elif len(parts) >= 3 and parts[1].lower() == 'remove':
-                            handle_portfolio(chat_id, 'remove', parts[2])
-                        else:
-                            handle_portfolio(chat_id)
-
-                    elif cmd == '/screen' and len(parts) >= 2:
-                        handle_screen(chat_id, parts[1])
-
-                    elif cmd == '/compare' and len(parts) >= 3:
-                        handle_compare(chat_id, parts[1], parts[2])
-
-                    else:
-                        send_message(chat_id, "❓ Unknown command. Use /help")
+                    except Exception as cmd_error:
+                        logger.error(f"Command error: {cmd_error}")
+                        try:
+                            send_message(chat_id, "❌ Error processing command. Try again.")
+                        except:
+                            pass
 
             # Check alerts every 5 minutes
             if time.time() - last_alert_check > 300:

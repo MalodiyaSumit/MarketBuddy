@@ -1010,13 +1010,11 @@ def send_market_summary():
 # ===== BOT LOOP =====
 def run_bot():
     logger.info("🚀 MarketBuddy Pro starting...")
+    logger.info(f"BOT_TOKEN: {BOT_TOKEN[:10]}...")
+    logger.info(f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
 
-    # Try to send startup message, but don't crash if it fails
-    try:
-        send_message(ADMIN_CHAT_ID, "🚀 *MarketBuddy Pro Started!*\n\nAll features active.\nUse /start for help.")
-        logger.info("Startup message sent successfully")
-    except Exception as e:
-        logger.error(f"Failed to send startup message: {e}")
+    # Skip startup message to avoid issues
+    logger.info("Skipping startup message, going directly to bot loop...")
 
     offset = None
     last_alert_check = time.time()

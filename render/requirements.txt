@@ -6,3 +6,5 @@ pandas
 numpy
 ta
 scikit-learn
+matplotlib
+mplfinance

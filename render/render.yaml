@@ -3,11 +3,9 @@ services:
     name: marketbuddy-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers=1 --threads=2 --timeout=120 bot:app
+    startCommand: gunicorn bot:app
     envVars:
       - key: BOT_TOKEN
         value: 8241472299:AAGhewPu-VZFXpuLyVBlhRZYrGPgxpCb7mI
       - key: ADMIN_CHAT_ID
         value: "2110121880"
-      - key: NEWSAPI_KEY
-        value: 5df4112f47a84dd6b7aa6e09a5be71db

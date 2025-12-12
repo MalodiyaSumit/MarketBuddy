@@ -43,6 +43,18 @@ active_signals = {}  # {signal_id: signal_data}
 trade_history = []  # Store completed trades for learning
 market_mistakes = []  # Track mistakes for improvement
 
+# ===== MARKET DATA CACHE =====
+# Cache for FII/DII, Option Chain, Economic Calendar
+market_data_cache = {
+    "fii_dii": None,
+    "fii_dii_updated": None,
+    "option_chain_nifty": None,
+    "option_chain_banknifty": None,
+    "option_chain_updated": None,
+    "economic_calendar": None,
+    "economic_calendar_updated": None,
+}
+
 # Indian Indices
 INDIAN_INDICES = {
     "NIFTY": "^NSEI", "NIFTY50": "^NSEI",
@@ -229,6 +241,449 @@ def get_gift_nifty_data():
     except Exception as e:
         logger.error(f"Gift Nifty error: {e}")
     return None
+
+
+# ===== FII/DII DATA =====
+
+def get_fii_dii_data():
+    """
+    Fetch FII/DII data from NSE website.
+    Returns buying/selling activity of institutional investors.
+    """
+    global market_data_cache
+
+    try:
+        # Check cache (data valid for 1 hour)
+        if market_data_cache["fii_dii"] and market_data_cache["fii_dii_updated"]:
+            cache_age = (datetime.now(IST) - market_data_cache["fii_dii_updated"]).seconds
+            if cache_age < 3600:  # 1 hour cache
+                return market_data_cache["fii_dii"]
+
+        # NSE requires specific headers
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/reports/fii-dii",
+        }
+
+        # Create session for cookies
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+
+        # Fetch FII/DII data
+        url = "https://www.nseindia.com/api/fiidiiTradeReact"
+        response = session.get(url, headers=headers, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            fii_data = None
+            dii_data = None
+
+            for item in data:
+                if item.get("category") == "FII/FPI":
+                    fii_data = item
+                elif item.get("category") == "DII":
+                    dii_data = item
+
+            if fii_data and dii_data:
+                result = {
+                    "date": datetime.now(IST).strftime("%Y-%m-%d"),
+                    "fii": {
+                        "buy": float(fii_data.get("buyValue", 0)),
+                        "sell": float(fii_data.get("sellValue", 0)),
+                        "net": float(fii_data.get("netValue", 0)),
+                    },
+                    "dii": {
+                        "buy": float(dii_data.get("buyValue", 0)),
+                        "sell": float(dii_data.get("sellValue", 0)),
+                        "net": float(dii_data.get("netValue", 0)),
+                    },
+                }
+
+                # Determine sentiment
+                fii_net = result["fii"]["net"]
+                dii_net = result["dii"]["net"]
+
+                if fii_net > 0 and dii_net > 0:
+                    result["sentiment"] = "STRONG BULLISH"
+                    result["sentiment_emoji"] = "🟢🟢"
+                    result["description"] = "Both FII & DII buying - Strong support for market"
+                elif fii_net > 0 and dii_net < 0:
+                    result["sentiment"] = "BULLISH"
+                    result["sentiment_emoji"] = "🟢"
+                    result["description"] = "FII buying, DII booking profits - Positive bias"
+                elif fii_net < 0 and dii_net > 0:
+                    result["sentiment"] = "CAUTIOUS"
+                    result["sentiment_emoji"] = "🟡"
+                    result["description"] = "FII selling, DII supporting - Be cautious"
+                else:
+                    result["sentiment"] = "BEARISH"
+                    result["sentiment_emoji"] = "🔴"
+                    result["description"] = "Both FII & DII selling - Market under pressure"
+
+                # Cache the result
+                market_data_cache["fii_dii"] = result
+                market_data_cache["fii_dii_updated"] = datetime.now(IST)
+
+                return result
+
+    except Exception as e:
+        logger.error(f"FII/DII fetch error: {e}")
+
+    # Return cached data if fetch fails
+    if market_data_cache["fii_dii"]:
+        return market_data_cache["fii_dii"]
+
+    return None
+
+
+# ===== OPTION CHAIN DATA =====
+
+def get_option_chain_data(symbol="NIFTY"):
+    """
+    Fetch Option Chain data from NSE for PCR, Max Pain, OI analysis.
+    """
+    global market_data_cache
+
+    try:
+        cache_key = f"option_chain_{symbol.lower()}"
+
+        # Check cache (valid for 5 minutes during market hours)
+        if market_data_cache.get(cache_key) and market_data_cache["option_chain_updated"]:
+            cache_age = (datetime.now(IST) - market_data_cache["option_chain_updated"]).seconds
+            if cache_age < 300:  # 5 minute cache
+                return market_data_cache[cache_key]
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/option-chain",
+        }
+
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+
+        # Fetch option chain
+        if symbol.upper() in ["NIFTY", "NIFTY50"]:
+            url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+        elif symbol.upper() == "BANKNIFTY":
+            url = "https://www.nseindia.com/api/option-chain-indices?symbol=BANKNIFTY"
+        else:
+            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol.upper()}"
+
+        response = session.get(url, headers=headers, timeout=15)
+
+        if response.status_code == 200:
+            data = response.json()
+            records = data.get("records", {})
+            option_data = records.get("data", [])
+            underlying_value = records.get("underlyingValue", 0)
+
+            if not option_data:
+                return None
+
+            # Calculate PCR (Put-Call Ratio)
+            total_call_oi = 0
+            total_put_oi = 0
+            total_call_volume = 0
+            total_put_volume = 0
+
+            # For Max Pain calculation
+            strike_data = {}
+
+            for item in option_data:
+                strike = item.get("strikePrice", 0)
+
+                ce_data = item.get("CE", {})
+                pe_data = item.get("PE", {})
+
+                ce_oi = ce_data.get("openInterest", 0) or 0
+                pe_oi = pe_data.get("openInterest", 0) or 0
+                ce_vol = ce_data.get("totalTradedVolume", 0) or 0
+                pe_vol = pe_data.get("totalTradedVolume", 0) or 0
+
+                total_call_oi += ce_oi
+                total_put_oi += pe_oi
+                total_call_volume += ce_vol
+                total_put_volume += pe_vol
+
+                strike_data[strike] = {
+                    "ce_oi": ce_oi,
+                    "pe_oi": pe_oi,
+                    "ce_volume": ce_vol,
+                    "pe_volume": pe_vol,
+                }
+
+            # PCR Ratio
+            pcr_oi = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+            pcr_volume = total_put_volume / total_call_volume if total_call_volume > 0 else 0
+
+            # Find Max Pain (strike with maximum OI on both sides)
+            max_pain_strike = 0
+            max_total_oi = 0
+            for strike, oi_data in strike_data.items():
+                total_oi = oi_data["ce_oi"] + oi_data["pe_oi"]
+                if total_oi > max_total_oi:
+                    max_total_oi = total_oi
+                    max_pain_strike = strike
+
+            # Find highest OI strikes (support/resistance)
+            sorted_by_ce_oi = sorted(strike_data.items(), key=lambda x: x[1]["ce_oi"], reverse=True)
+            sorted_by_pe_oi = sorted(strike_data.items(), key=lambda x: x[1]["pe_oi"], reverse=True)
+
+            max_ce_oi_strike = sorted_by_ce_oi[0][0] if sorted_by_ce_oi else 0
+            max_pe_oi_strike = sorted_by_pe_oi[0][0] if sorted_by_pe_oi else 0
+
+            # Determine sentiment from PCR
+            if pcr_oi > 1.2:
+                pcr_sentiment = "BULLISH"
+                pcr_description = "High PCR indicates more puts sold - Bullish sentiment"
+            elif pcr_oi < 0.8:
+                pcr_sentiment = "BEARISH"
+                pcr_description = "Low PCR indicates more calls sold - Bearish sentiment"
+            else:
+                pcr_sentiment = "NEUTRAL"
+                pcr_description = "PCR in neutral zone - No clear directional bias"
+
+            result = {
+                "symbol": symbol.upper(),
+                "underlying": underlying_value,
+                "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M"),
+                "pcr": {
+                    "oi": round(pcr_oi, 2),
+                    "volume": round(pcr_volume, 2),
+                    "sentiment": pcr_sentiment,
+                    "description": pcr_description,
+                },
+                "max_pain": max_pain_strike,
+                "total_call_oi": total_call_oi,
+                "total_put_oi": total_put_oi,
+                "resistance": max_ce_oi_strike,  # Highest Call OI = Resistance
+                "support": max_pe_oi_strike,     # Highest Put OI = Support
+                "analysis": {
+                    "max_ce_oi": sorted_by_ce_oi[0][1]["ce_oi"] if sorted_by_ce_oi else 0,
+                    "max_pe_oi": sorted_by_pe_oi[0][1]["pe_oi"] if sorted_by_pe_oi else 0,
+                }
+            }
+
+            # Cache result
+            market_data_cache[cache_key] = result
+            market_data_cache["option_chain_updated"] = datetime.now(IST)
+
+            return result
+
+    except Exception as e:
+        logger.error(f"Option chain fetch error for {symbol}: {e}")
+
+    return market_data_cache.get(f"option_chain_{symbol.lower()}")
+
+
+# ===== ECONOMIC CALENDAR =====
+
+# Important economic events for India
+ECONOMIC_EVENTS = {
+    "RBI_POLICY": {
+        "name": "RBI Monetary Policy",
+        "impact": "HIGH",
+        "affects": ["NIFTY", "BANKNIFTY", "All Banking Stocks"],
+        "description": "Interest rate decision affects entire market"
+    },
+    "US_FED": {
+        "name": "US Federal Reserve Meeting",
+        "impact": "HIGH",
+        "affects": ["NIFTY", "IT Stocks", "Export Stocks"],
+        "description": "US rate decision impacts global markets"
+    },
+    "GDP_DATA": {
+        "name": "India GDP Data",
+        "impact": "HIGH",
+        "affects": ["NIFTY", "Infrastructure", "Banking"],
+        "description": "Economic growth indicator"
+    },
+    "INFLATION_CPI": {
+        "name": "CPI Inflation Data",
+        "impact": "MEDIUM",
+        "affects": ["NIFTY", "FMCG", "Banking"],
+        "description": "Consumer inflation affects RBI policy"
+    },
+    "IIP_DATA": {
+        "name": "IIP (Industrial Production)",
+        "impact": "MEDIUM",
+        "affects": ["Manufacturing", "Auto", "Capital Goods"],
+        "description": "Industrial growth indicator"
+    },
+    "EXPIRY": {
+        "name": "F&O Expiry",
+        "impact": "HIGH",
+        "affects": ["NIFTY", "BANKNIFTY", "Stock Futures"],
+        "description": "High volatility expected - avoid new positions"
+    },
+}
+
+
+def get_upcoming_economic_events():
+    """
+    Get upcoming economic events for the next 7 days.
+    Uses a combination of known dates and web scraping.
+    """
+    global market_data_cache
+
+    try:
+        # Check cache
+        if market_data_cache["economic_calendar"] and market_data_cache["economic_calendar_updated"]:
+            cache_age = (datetime.now(IST) - market_data_cache["economic_calendar_updated"]).seconds
+            if cache_age < 3600:  # 1 hour cache
+                return market_data_cache["economic_calendar"]
+
+        now = datetime.now(IST)
+        events = []
+
+        # Calculate F&O Expiry (Last Thursday of month for monthly, every Thursday for weekly)
+        # Weekly expiry
+        days_until_thursday = (3 - now.weekday()) % 7
+        if days_until_thursday == 0 and now.hour >= 15:
+            days_until_thursday = 7
+        next_thursday = now + timedelta(days=days_until_thursday)
+
+        if days_until_thursday <= 7:
+            events.append({
+                "date": next_thursday.strftime("%Y-%m-%d"),
+                "day": next_thursday.strftime("%A"),
+                "event": "Weekly F&O Expiry",
+                "impact": "HIGH",
+                "description": "NIFTY & BANKNIFTY weekly options expire. Expect high volatility.",
+                "recommendation": "Avoid new positions, book profits before 2 PM"
+            })
+
+        # Check for monthly expiry (last Thursday)
+        last_day = (now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        last_thursday = last_day
+        while last_thursday.weekday() != 3:
+            last_thursday -= timedelta(days=1)
+
+        days_to_monthly = (last_thursday - now).days
+        if 0 <= days_to_monthly <= 7:
+            events.append({
+                "date": last_thursday.strftime("%Y-%m-%d"),
+                "day": last_thursday.strftime("%A"),
+                "event": "Monthly F&O Expiry",
+                "impact": "VERY HIGH",
+                "description": "Stock futures & options expire. Maximum volatility day.",
+                "recommendation": "Square off positions, avoid leverage"
+            })
+
+        # Try to fetch from investing.com or use fallback
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+            # This is a simplified approach - in production, you'd parse the actual calendar
+            # For now, we'll use known recurring events
+
+            # Check if RBI policy is likely (usually first week of bi-monthly)
+            if now.day <= 7 and now.month in [2, 4, 6, 8, 10, 12]:
+                events.append({
+                    "date": f"{now.year}-{now.month:02d}-{min(now.day + 3, 7):02d}",
+                    "day": "This Week",
+                    "event": "RBI Monetary Policy (Possible)",
+                    "impact": "HIGH",
+                    "description": "RBI rate decision. Watch for policy announcement.",
+                    "recommendation": "Avoid BANKNIFTY positions until announcement"
+                })
+
+        except:
+            pass
+
+        # Sort by date
+        events.sort(key=lambda x: x["date"])
+
+        result = {
+            "updated": now.strftime("%Y-%m-%d %H:%M"),
+            "events": events[:10],  # Max 10 events
+            "next_important": events[0] if events else None,
+        }
+
+        market_data_cache["economic_calendar"] = result
+        market_data_cache["economic_calendar_updated"] = now
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Economic calendar error: {e}")
+
+    return market_data_cache.get("economic_calendar")
+
+
+def get_market_sentiment_summary():
+    """
+    Combine FII/DII, Option Chain, and other data for overall market sentiment.
+    This is used to improve signal accuracy.
+    """
+    sentiment_score = 50  # Start neutral
+
+    # Get FII/DII data
+    fii_dii = get_fii_dii_data()
+    if fii_dii:
+        if fii_dii["sentiment"] == "STRONG BULLISH":
+            sentiment_score += 20
+        elif fii_dii["sentiment"] == "BULLISH":
+            sentiment_score += 10
+        elif fii_dii["sentiment"] == "BEARISH":
+            sentiment_score -= 15
+        elif fii_dii["sentiment"] == "CAUTIOUS":
+            sentiment_score -= 5
+
+    # Get Option Chain data for NIFTY
+    oc_nifty = get_option_chain_data("NIFTY")
+    if oc_nifty:
+        pcr = oc_nifty["pcr"]["oi"]
+        if pcr > 1.3:
+            sentiment_score += 15  # Very bullish
+        elif pcr > 1.1:
+            sentiment_score += 8
+        elif pcr < 0.7:
+            sentiment_score -= 15  # Very bearish
+        elif pcr < 0.9:
+            sentiment_score -= 8
+
+    # Clamp score
+    sentiment_score = max(0, min(100, sentiment_score))
+
+    # Determine overall sentiment
+    if sentiment_score >= 70:
+        overall = "BULLISH"
+        emoji = "🟢"
+        advice = "Favor long positions, buy on dips"
+    elif sentiment_score >= 55:
+        overall = "MILDLY BULLISH"
+        emoji = "🟢"
+        advice = "Selective buying, maintain stop losses"
+    elif sentiment_score <= 30:
+        overall = "BEARISH"
+        emoji = "🔴"
+        advice = "Avoid fresh longs, consider hedging"
+    elif sentiment_score <= 45:
+        overall = "MILDLY BEARISH"
+        emoji = "🔴"
+        advice = "Be cautious, reduce position sizes"
+    else:
+        overall = "NEUTRAL"
+        emoji = "🟡"
+        advice = "Wait for clear direction, trade light"
+
+    return {
+        "score": sentiment_score,
+        "sentiment": overall,
+        "emoji": emoji,
+        "advice": advice,
+        "components": {
+            "fii_dii": fii_dii["sentiment"] if fii_dii else "N/A",
+            "pcr": oc_nifty["pcr"]["oi"] if oc_nifty else "N/A",
+        }
+    }
 
 
 # ===== ACTIVE SIGNAL MANAGEMENT =====
@@ -1262,6 +1717,14 @@ Hello {user_name}! I'm your AI-powered stock analysis assistant.
 /summary - NIFTY, SENSEX, BANKNIFTY
 /news - Latest market news
 
+*📊 MARKET ANALYSIS (NEW!):*
+/fiidii - FII/DII buying/selling data
+/oi NIFTY - Option Chain analysis (PCR, Support, Resistance)
+/oi BANKNIFTY - Bank NIFTY option chain
+/pcr - Quick NIFTY PCR check
+/calendar - Upcoming economic events
+/sentiment - Overall market sentiment score
+
 *📋 PORTFOLIO:*
 /watchlist - View your watchlist
 /watchlist add/remove SYMBOL
@@ -1270,17 +1733,18 @@ Hello {user_name}! I'm your AI-powered stock analysis assistant.
 /alert SYMBOL PRICE - Set price alert
 /alerts - View your alerts
 
-*🤖 AUTOMATIC FEATURES:*
-  ✅ Target Hit Notifications (real-time)
-  ✅ Stop Loss Alerts
-  ✅ Signal Expiry Alerts
-  ✅ Index Signals (NIFTY/BANKNIFTY)
-  ✅ Gift Nifty Close (7PM & 11:30PM)
+*🤖 AUTOMATIC ALERTS:*
+  ✅ Morning Briefing (8:45 AM)
   ✅ Market Open/Close Alerts
+  ✅ FII/DII Daily Update (4:30 PM)
+  ✅ Target Hit Notifications (real-time)
+  ✅ Stop Loss & Expiry Alerts
+  ✅ Index Signals (NIFTY/BANKNIFTY)
+  ✅ Gift Nifty (7PM & 11:30PM)
+  ✅ Tomorrow's Events (8 PM)
   ✅ High Confidence Opportunities
   ✅ Breaking News Alerts
   ✅ Weekly Report (Saturday 6PM)
-  ✅ Mistake Tracking for Learning
 
 *Signal Format Includes:*
   • Current Price
@@ -1827,6 +2291,258 @@ _Gift Nifty trades on SGX from 6:30 AM to 11:30 PM IST_"""
     send_message(chat_id, msg)
 
 
+def handle_fiidii(chat_id):
+    """Show FII/DII data with analysis."""
+    send_message(chat_id, "Fetching FII/DII data...")
+
+    fii_dii = get_fii_dii_data()
+
+    if not fii_dii:
+        send_message(chat_id, "Unable to fetch FII/DII data. NSE may be down. Try again later.")
+        return
+
+    now = datetime.now(IST)
+
+    msg = f"""📊 *FII/DII ACTIVITY*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*FII/FPI (Foreign Institutional Investors):*
+  💰 Buy: ₹{fii_dii['fii']['buy']:,.2f} Cr
+  💸 Sell: ₹{fii_dii['fii']['sell']:,.2f} Cr
+  📊 Net: ₹{fii_dii['fii']['net']:+,.2f} Cr {'✅' if fii_dii['fii']['net'] > 0 else '❌'}
+
+*DII (Domestic Institutional Investors):*
+  💰 Buy: ₹{fii_dii['dii']['buy']:,.2f} Cr
+  💸 Sell: ₹{fii_dii['dii']['sell']:,.2f} Cr
+  📊 Net: ₹{fii_dii['dii']['net']:+,.2f} Cr {'✅' if fii_dii['dii']['net'] > 0 else '❌'}
+
+{'='*30}
+*SENTIMENT: {fii_dii['sentiment']}* {fii_dii['sentiment_emoji']}
+
+📝 {fii_dii['description']}
+
+*What This Means:*
+"""
+    if fii_dii['sentiment'] == "STRONG BULLISH":
+        msg += """  ✅ Both institutions buying
+  ✅ Strong market support
+  ✅ Good for long positions"""
+    elif fii_dii['sentiment'] == "BULLISH":
+        msg += """  ✅ FII driving market up
+  ⚠️ DII booking profits
+  ✅ Overall positive bias"""
+    elif fii_dii['sentiment'] == "CAUTIOUS":
+        msg += """  ⚠️ FII exiting positions
+  ✅ DII providing support
+  ⚠️ Be selective in buying"""
+    else:
+        msg += """  ❌ Both selling heavily
+  ❌ Market under pressure
+  ❌ Avoid fresh positions"""
+
+    msg += """
+
+_Data from NSE. Updates after market hours._"""
+
+    send_message(chat_id, msg)
+
+
+def handle_optionchain(chat_id, symbol="NIFTY"):
+    """Show Option Chain analysis for NIFTY/BANKNIFTY."""
+    send_message(chat_id, f"Fetching Option Chain for {symbol.upper()}...")
+
+    oc_data = get_option_chain_data(symbol)
+
+    if not oc_data:
+        send_message(chat_id, f"Unable to fetch Option Chain for {symbol}. Try again later.")
+        return
+
+    now = datetime.now(IST)
+    pcr = oc_data['pcr']
+
+    # PCR interpretation emoji
+    if pcr['oi'] > 1.2:
+        pcr_emoji = "🟢🟢"
+    elif pcr['oi'] > 1.0:
+        pcr_emoji = "🟢"
+    elif pcr['oi'] < 0.8:
+        pcr_emoji = "🔴🔴"
+    elif pcr['oi'] < 1.0:
+        pcr_emoji = "🔴"
+    else:
+        pcr_emoji = "🟡"
+
+    msg = f"""📊 *OPTION CHAIN ANALYSIS*
+*{oc_data['symbol']}*
+_{oc_data['timestamp']} IST_
+
+📈 *Spot Price:* {oc_data['underlying']:,.2f}
+
+{'='*30}
+*PCR (PUT-CALL RATIO)* {pcr_emoji}
+{'='*30}
+
+📊 *PCR (OI):* {pcr['oi']}
+📊 *PCR (Volume):* {pcr['volume']}
+📊 *Sentiment:* {pcr['sentiment']}
+
+📝 {pcr['description']}
+
+{'='*30}
+*KEY LEVELS (Based on OI)*
+{'='*30}
+
+🔺 *Resistance:* {oc_data['resistance']:,}
+   (Highest Call OI - {oc_data['analysis']['max_ce_oi']:,} contracts)
+
+🔻 *Support:* {oc_data['support']:,}
+   (Highest Put OI - {oc_data['analysis']['max_pe_oi']:,} contracts)
+
+🎯 *Max Pain:* {oc_data['max_pain']:,}
+   (Market likely to expire near this level)
+
+{'='*30}
+*OPEN INTEREST SUMMARY*
+{'='*30}
+
+📞 Total Call OI: {oc_data['total_call_oi']:,}
+📉 Total Put OI: {oc_data['total_put_oi']:,}
+
+*Trading Implication:*
+"""
+    if pcr['oi'] > 1.2:
+        msg += """  ✅ More puts written = Writers expect support
+  ✅ Market likely to stay above support
+  ✅ Bullish bias for {symbol}"""
+    elif pcr['oi'] < 0.8:
+        msg += """  ⚠️ More calls written = Writers expect resistance
+  ⚠️ Market may face selling pressure
+  ⚠️ Bearish bias for {symbol}"""
+    else:
+        msg += """  ➡️ Balanced OI = No clear direction
+  ➡️ Range-bound movement expected
+  ➡️ Trade with caution"""
+
+    msg += """
+
+_Data from NSE Option Chain. Updates every 5 min._"""
+
+    send_message(chat_id, msg.format(symbol=symbol.upper()))
+
+
+def handle_calendar(chat_id):
+    """Show upcoming economic events."""
+    calendar = get_upcoming_economic_events()
+
+    if not calendar or not calendar.get('events'):
+        send_message(chat_id, "No major economic events in the next 7 days.")
+        return
+
+    now = datetime.now(IST)
+
+    msg = f"""📅 *ECONOMIC CALENDAR*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*Upcoming Events (Next 7 Days):*
+
+"""
+
+    for event in calendar['events']:
+        impact_emoji = "🔴" if event['impact'] in ["HIGH", "VERY HIGH"] else "🟡"
+
+        msg += f"""{impact_emoji} *{event['event']}*
+  📅 Date: {event['date']} ({event['day']})
+  ⚡ Impact: {event['impact']}
+  📝 {event['description']}
+  💡 {event['recommendation']}
+
+"""
+
+    if calendar.get('next_important'):
+        next_event = calendar['next_important']
+        msg += f"""{'='*30}
+⚠️ *NEXT IMPORTANT EVENT:*
+*{next_event['event']}* on {next_event['date']}
+
+*Recommendation:* {next_event['recommendation']}
+"""
+
+    msg += """
+_Events may affect market volatility. Plan accordingly._"""
+
+    send_message(chat_id, msg)
+
+
+def handle_sentiment(chat_id):
+    """Show overall market sentiment combining all data sources."""
+    send_message(chat_id, "Analyzing market sentiment...")
+
+    sentiment = get_market_sentiment_summary()
+    fii_dii = get_fii_dii_data()
+    oc_nifty = get_option_chain_data("NIFTY")
+    calendar = get_upcoming_economic_events()
+
+    now = datetime.now(IST)
+
+    msg = f"""🎯 *MARKET SENTIMENT ANALYSIS*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+{'='*30}
+*OVERALL SENTIMENT: {sentiment['sentiment']}* {sentiment['emoji']}
+*Score: {sentiment['score']}/100*
+{'='*30}
+
+*Components:*
+
+1️⃣ *FII/DII:* {sentiment['components']['fii_dii']}
+"""
+    if fii_dii:
+        msg += f"   FII Net: ₹{fii_dii['fii']['net']:+,.0f} Cr\n"
+        msg += f"   DII Net: ₹{fii_dii['dii']['net']:+,.0f} Cr\n"
+
+    msg += f"""
+2️⃣ *PCR (NIFTY):* {sentiment['components']['pcr']}
+"""
+    if oc_nifty:
+        msg += f"   Support: {oc_nifty['support']:,}\n"
+        msg += f"   Resistance: {oc_nifty['resistance']:,}\n"
+
+    msg += """
+3️⃣ *Economic Calendar:*
+"""
+    if calendar and calendar.get('next_important'):
+        msg += f"   Next: {calendar['next_important']['event']}\n"
+        msg += f"   Impact: {calendar['next_important']['impact']}\n"
+    else:
+        msg += "   No major events this week\n"
+
+    msg += f"""
+{'='*30}
+*TRADING ADVICE:*
+💡 {sentiment['advice']}
+
+*Action Plan:*
+"""
+    if sentiment['score'] >= 60:
+        msg += """  ✅ Buy on dips near support levels
+  ✅ Trail stop losses on existing longs
+  ✅ Index calls can be considered"""
+    elif sentiment['score'] <= 40:
+        msg += """  ⚠️ Avoid fresh long positions
+  ⚠️ Book profits on rallies
+  ⚠️ Keep position sizes small"""
+    else:
+        msg += """  ➡️ Wait for clear breakout/breakdown
+  ➡️ Trade only high confidence setups
+  ➡️ Maintain hedged positions"""
+
+    msg += """
+
+_Sentiment updates with market data._"""
+
+    send_message(chat_id, msg)
+
+
 # ===== AUTOMATIC ALERTS =====
 
 def send_market_summary_auto():
@@ -1913,6 +2629,151 @@ Indian Stock Market is NOW CLOSED! 🔴
     msg += "\nSee you tomorrow! 👋"
     send_message(ADMIN_CHAT_ID, msg)
     logger.info("Market close alert sent")
+
+
+def send_fiidii_daily_alert():
+    """Send daily FII/DII update at 4:30 PM after market close."""
+    try:
+        fii_dii = get_fii_dii_data()
+
+        if not fii_dii:
+            logger.warning("Could not fetch FII/DII for daily alert")
+            return
+
+        now = datetime.now(IST)
+
+        msg = f"""📊 *DAILY FII/DII UPDATE*
+_{now.strftime('%Y-%m-%d')} IST_
+
+*FII/FPI:*
+  Net: ₹{fii_dii['fii']['net']:+,.2f} Cr {'✅ BUYING' if fii_dii['fii']['net'] > 0 else '❌ SELLING'}
+
+*DII:*
+  Net: ₹{fii_dii['dii']['net']:+,.2f} Cr {'✅ BUYING' if fii_dii['dii']['net'] > 0 else '❌ SELLING'}
+
+*Sentiment: {fii_dii['sentiment']}* {fii_dii['sentiment_emoji']}
+
+📝 {fii_dii['description']}
+
+_Tomorrow's outlook: {'Positive' if fii_dii['fii']['net'] > 0 else 'Cautious'}_"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info("FII/DII daily alert sent")
+
+    except Exception as e:
+        logger.error(f"FII/DII daily alert error: {e}")
+
+
+def send_morning_briefing():
+    """
+    Send comprehensive morning briefing at 8:45 AM before market open.
+    Includes: Gift Nifty, FII/DII, Option Chain, Calendar events
+    """
+    try:
+        now = datetime.now(IST)
+
+        msg = f"""🌅 *MORNING MARKET BRIEFING*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+"""
+
+        # Gift Nifty
+        gift_data = get_gift_nifty_data()
+        if gift_data:
+            emoji = "📈" if gift_data['change'] >= 0 else "📉"
+            msg += f"""*GIFT NIFTY:*
+{emoji} {gift_data['current']:,.2f} ({gift_data['pct']:+.2f}%)
+Expected Opening: {'Gap Up' if gift_data['pct'] > 0.3 else 'Gap Down' if gift_data['pct'] < -0.3 else 'Flat'}
+
+"""
+
+        # FII/DII
+        fii_dii = get_fii_dii_data()
+        if fii_dii:
+            msg += f"""*FII/DII (Previous Day):*
+FII: ₹{fii_dii['fii']['net']:+,.0f} Cr | DII: ₹{fii_dii['dii']['net']:+,.0f} Cr
+Sentiment: {fii_dii['sentiment']} {fii_dii['sentiment_emoji']}
+
+"""
+
+        # Option Chain - Support/Resistance
+        oc_nifty = get_option_chain_data("NIFTY")
+        if oc_nifty:
+            msg += f"""*NIFTY OI LEVELS:*
+🔻 Support: {oc_nifty['support']:,}
+🔺 Resistance: {oc_nifty['resistance']:,}
+PCR: {oc_nifty['pcr']['oi']} ({oc_nifty['pcr']['sentiment']})
+
+"""
+
+        # Today's Events
+        calendar = get_upcoming_economic_events()
+        if calendar and calendar.get('events'):
+            today = now.strftime('%Y-%m-%d')
+            today_events = [e for e in calendar['events'] if e['date'] == today]
+            if today_events:
+                msg += "*TODAY'S EVENTS:*\n"
+                for event in today_events:
+                    msg += f"  ⚠️ {event['event']} ({event['impact']})\n"
+                msg += "\n"
+
+        # Overall Sentiment
+        sentiment = get_market_sentiment_summary()
+        msg += f"""{'='*30}
+*TODAY'S OUTLOOK: {sentiment['sentiment']}* {sentiment['emoji']}
+💡 {sentiment['advice']}
+
+_Market opens at 9:15 AM IST_"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info("Morning briefing sent")
+
+    except Exception as e:
+        logger.error(f"Morning briefing error: {e}")
+
+
+def send_calendar_event_alert():
+    """
+    Send alert for tomorrow's important events at 8 PM.
+    """
+    try:
+        calendar = get_upcoming_economic_events()
+
+        if not calendar or not calendar.get('events'):
+            return
+
+        now = datetime.now(IST)
+        tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+
+        # Check for tomorrow's events
+        tomorrow_events = [e for e in calendar['events'] if e['date'] == tomorrow]
+
+        if not tomorrow_events:
+            return
+
+        msg = f"""📅 *TOMORROW'S MARKET EVENTS*
+_{tomorrow}_
+
+"""
+
+        for event in tomorrow_events:
+            impact_emoji = "🔴" if event['impact'] in ["HIGH", "VERY HIGH"] else "🟡"
+            msg += f"""{impact_emoji} *{event['event']}*
+  Impact: {event['impact']}
+  📝 {event['description']}
+  💡 {event['recommendation']}
+
+"""
+
+        msg += """⚠️ *Plan your trades accordingly!*
+
+_Events can cause high volatility._"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info(f"Calendar event alert sent for {len(tomorrow_events)} events")
+
+    except Exception as e:
+        logger.error(f"Calendar event alert error: {e}")
 
 
 def check_breaking_news():
@@ -2424,6 +3285,13 @@ def run_scheduler():
 
             # ===== WEEKDAY ALERTS =====
 
+            # ===== MORNING BRIEFING - 8:45 AM =====
+            # Comprehensive pre-market briefing with Gift Nifty, FII/DII, OI levels
+            if current_hour == 8 and current_minute == 45:
+                if last_scheduled_alert.get('morning_briefing') != today_key:
+                    send_morning_briefing()
+                    last_scheduled_alert['morning_briefing'] = today_key
+
             # Market Open Alert - 9:15 AM
             if current_hour == 9 and current_minute == 15:
                 if last_scheduled_alert.get('market_open') != today_key:
@@ -2484,6 +3352,20 @@ def run_scheduler():
                 if last_scheduled_alert.get('gift_nifty_evening') != today_key:
                     send_gift_nifty_close_notification()
                     last_scheduled_alert['gift_nifty_evening'] = today_key
+
+            # ===== FII/DII DAILY ALERT - 4:30 PM =====
+            # Send FII/DII data after market close
+            if current_hour == 16 and current_minute == 30:
+                if last_scheduled_alert.get('fiidii_daily') != today_key:
+                    send_fiidii_daily_alert()
+                    last_scheduled_alert['fiidii_daily'] = today_key
+
+            # ===== CALENDAR EVENT ALERT - 8 PM =====
+            # Alert about tomorrow's important events
+            if current_hour == 20 and current_minute == 0:
+                if last_scheduled_alert.get('calendar_alert') != today_key:
+                    send_calendar_event_alert()
+                    last_scheduled_alert['calendar_alert'] = today_key
 
             time.sleep(60)  # Check every minute
 
@@ -2590,6 +3472,17 @@ def run_bot():
                             handle_stock(chat_id, 'BANKNIFTY')
                         elif cmd == '/sensex':
                             handle_stock(chat_id, 'SENSEX')
+                        elif cmd == '/fiidii':
+                            handle_fiidii(chat_id)
+                        elif cmd == '/oi' or cmd == '/optionchain':
+                            symbol = parts[1].upper() if len(parts) >= 2 else "NIFTY"
+                            handle_optionchain(chat_id, symbol)
+                        elif cmd == '/calendar':
+                            handle_calendar(chat_id)
+                        elif cmd == '/sentiment':
+                            handle_sentiment(chat_id)
+                        elif cmd == '/pcr':
+                            handle_optionchain(chat_id, "NIFTY")
                         else:
                             send_message(chat_id, "Unknown command. Use /help")
 

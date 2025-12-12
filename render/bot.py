@@ -2737,20 +2737,59 @@ _Use /calendar for upcoming market events_"""
 
 """
 
-            # Financials (4 years)
+            # Financials (4 years) - Show all years separately
             fin = ipo.get('financials', {})
-            if fin:
-                msg += "*📊 FINANCIALS (Last 4 Years):*\n"
+            if fin and any([fin.get('revenue'), fin.get('net_profit'), fin.get('debt')]):
+                current_year = datetime.now().year
+                years = [f"FY{current_year-4}", f"FY{current_year-3}", f"FY{current_year-2}", f"FY{current_year-1}"]
+
+                msg += "*📊 FINANCIALS (Last 4 Years):*\n\n"
+
                 if fin.get('revenue'):
                     rev = fin['revenue']
-                    msg += f"  Revenue: ₹{rev[0]}Cr → ₹{rev[-1]}Cr\n"
+                    msg += "*Revenue (₹ Cr):*\n"
+                    for i, val in enumerate(rev):
+                        yr = years[i] if i < len(years) else f"Y{i+1}"
+                        growth = ""
+                        if i > 0 and rev[i-1] > 0:
+                            growth_pct = ((val - rev[i-1]) / rev[i-1]) * 100
+                            growth = f" ({growth_pct:+.1f}%)"
+                        msg += f"  {yr}: ₹{val:,.0f} Cr{growth}\n"
+                    # Calculate CAGR
+                    if len(rev) >= 2 and rev[0] > 0:
+                        cagr = ((rev[-1] / rev[0]) ** (1/(len(rev)-1)) - 1) * 100
+                        msg += f"  📈 CAGR: {cagr:.1f}%\n"
+                    msg += "\n"
+
                 if fin.get('net_profit'):
                     prof = fin['net_profit']
-                    msg += f"  Net Profit: ₹{prof[0]}Cr → ₹{prof[-1]}Cr\n"
+                    msg += "*Net Profit (₹ Cr):*\n"
+                    for i, val in enumerate(prof):
+                        yr = years[i] if i < len(years) else f"Y{i+1}"
+                        growth = ""
+                        if i > 0 and prof[i-1] > 0:
+                            growth_pct = ((val - prof[i-1]) / prof[i-1]) * 100
+                            growth = f" ({growth_pct:+.1f}%)"
+                        emoji = "🟢" if val > 0 else "🔴"
+                        msg += f"  {yr}: {emoji} ₹{val:,.0f} Cr{growth}\n"
+                    # Calculate CAGR
+                    if len(prof) >= 2 and prof[0] > 0 and prof[-1] > 0:
+                        cagr = ((prof[-1] / prof[0]) ** (1/(len(prof)-1)) - 1) * 100
+                        msg += f"  📈 CAGR: {cagr:.1f}%\n"
+                    msg += "\n"
+
                 if fin.get('debt'):
                     debt = fin['debt']
-                    msg += f"  Debt: ₹{debt[0]}Cr → ₹{debt[-1]}Cr\n"
-                msg += "\n"
+                    msg += "*Debt (₹ Cr):*\n"
+                    for i, val in enumerate(debt):
+                        yr = years[i] if i < len(years) else f"Y{i+1}"
+                        change = ""
+                        if i > 0:
+                            diff = val - debt[i-1]
+                            change = f" ({diff:+.0f})"
+                        emoji = "🟢" if val < debt[0] else "🟡" if val == debt[0] else "🔴"
+                        msg += f"  {yr}: {emoji} ₹{val:,.0f} Cr{change}\n"
+                    msg += "\n"
 
             # Positives
             if analysis['positives']:

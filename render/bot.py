@@ -176,7 +176,172 @@ def get_market_news(limit=5):
         logger.error(f"News error: {e}")
     return []
 
-# ===== ANALYSIS =====
+# ===== ENHANCED ANALYSIS WITH 0-100 CONFIDENCE SCORE =====
+def calculate_confidence_score(df, latest):
+    """
+    Calculate a confidence score from 0-100 based on multiple factors:
+    - RSI (20 points max)
+    - MACD (20 points max)
+    - SMA Crossover (15 points max)
+    - Bollinger Bands (15 points max)
+    - Volume Analysis (15 points max)
+    - Price Momentum (15 points max)
+    """
+    import pandas as pd
+
+    score = 50  # Start neutral
+    factors = {}
+
+    # 1. RSI Analysis (±20 points)
+    rsi = latest.get('rsi')
+    if rsi and not pd.isna(rsi):
+        if rsi < 25:
+            score += 20  # Extremely oversold - strong buy
+            factors['RSI'] = f"EXTREMELY OVERSOLD ({rsi:.1f}) +20"
+        elif rsi < 30:
+            score += 15  # Oversold - buy
+            factors['RSI'] = f"OVERSOLD ({rsi:.1f}) +15"
+        elif rsi < 40:
+            score += 8  # Slightly oversold
+            factors['RSI'] = f"SLIGHTLY OVERSOLD ({rsi:.1f}) +8"
+        elif rsi > 75:
+            score -= 20  # Extremely overbought - strong sell
+            factors['RSI'] = f"EXTREMELY OVERBOUGHT ({rsi:.1f}) -20"
+        elif rsi > 70:
+            score -= 15  # Overbought - sell
+            factors['RSI'] = f"OVERBOUGHT ({rsi:.1f}) -15"
+        elif rsi > 60:
+            score -= 8  # Slightly overbought
+            factors['RSI'] = f"SLIGHTLY OVERBOUGHT ({rsi:.1f}) -8"
+        else:
+            factors['RSI'] = f"NEUTRAL ({rsi:.1f}) +0"
+
+    # 2. MACD Analysis (±20 points)
+    macd_val = latest.get('macd')
+    macd_sig = latest.get('macd_signal')
+    if macd_val and macd_sig and not (pd.isna(macd_val) or pd.isna(macd_sig)):
+        macd_diff = macd_val - macd_sig
+
+        # Check for crossover in last 3 days
+        if len(df) >= 3:
+            prev_macd = df['macd'].iloc[-3:-1]
+            prev_sig = df['macd_signal'].iloc[-3:-1]
+            recent_cross_up = any((prev_macd.iloc[i] < prev_sig.iloc[i]) for i in range(len(prev_macd)) if not pd.isna(prev_macd.iloc[i]))
+            recent_cross_down = any((prev_macd.iloc[i] > prev_sig.iloc[i]) for i in range(len(prev_macd)) if not pd.isna(prev_macd.iloc[i]))
+        else:
+            recent_cross_up = recent_cross_down = False
+
+        if macd_diff > 0:
+            if recent_cross_up and macd_val > macd_sig:
+                score += 20  # Fresh bullish crossover
+                factors['MACD'] = f"BULLISH CROSSOVER +20"
+            else:
+                score += 12  # Bullish
+                factors['MACD'] = f"BULLISH +12"
+        else:
+            if recent_cross_down and macd_val < macd_sig:
+                score -= 20  # Fresh bearish crossover
+                factors['MACD'] = f"BEARISH CROSSOVER -20"
+            else:
+                score -= 12  # Bearish
+                factors['MACD'] = f"BEARISH -12"
+
+    # 3. SMA Crossover (±15 points)
+    sma20 = latest.get('sma_20')
+    sma50 = latest.get('sma_50')
+    close = latest.get('close')
+    if sma20 and sma50 and close and not (pd.isna(sma20) or pd.isna(sma50)):
+        if sma20 > sma50:
+            if close > sma20:
+                score += 15  # Price above both SMAs in uptrend
+                factors['SMA'] = "STRONG UPTREND +15"
+            else:
+                score += 8  # Uptrend but price below SMA20
+                factors['SMA'] = "UPTREND +8"
+        else:
+            if close < sma20:
+                score -= 15  # Price below both SMAs in downtrend
+                factors['SMA'] = "STRONG DOWNTREND -15"
+            else:
+                score -= 8  # Downtrend but price above SMA20
+                factors['SMA'] = "DOWNTREND -8"
+
+    # 4. Bollinger Bands (±15 points)
+    bb_low = latest.get('bb_lower')
+    bb_up = latest.get('bb_upper')
+    if close and bb_low and bb_up and not (pd.isna(bb_low) or pd.isna(bb_up)):
+        bb_width = bb_up - bb_low
+        bb_position = (close - bb_low) / bb_width if bb_width > 0 else 0.5
+
+        if bb_position <= 0.1:
+            score += 15  # At/below lower band - strong buy
+            factors['BB'] = "AT LOWER BAND +15"
+        elif bb_position <= 0.25:
+            score += 8  # Near lower band
+            factors['BB'] = "NEAR LOWER BAND +8"
+        elif bb_position >= 0.9:
+            score -= 15  # At/above upper band - strong sell
+            factors['BB'] = "AT UPPER BAND -15"
+        elif bb_position >= 0.75:
+            score -= 8  # Near upper band
+            factors['BB'] = "NEAR UPPER BAND -8"
+        else:
+            factors['BB'] = "WITHIN BANDS +0"
+
+    # 5. Volume Analysis (±15 points)
+    volume = latest.get('volume')
+    if volume and not pd.isna(volume) and len(df) >= 20:
+        avg_volume = df['volume'].iloc[-20:].mean()
+        if avg_volume > 0:
+            vol_ratio = volume / avg_volume
+
+            price_change = 0
+            if len(df) >= 2:
+                prev_close = df['close'].iloc[-2]
+                if prev_close > 0:
+                    price_change = (close - prev_close) / prev_close * 100
+
+            if vol_ratio > 1.5 and price_change > 1:
+                score += 15  # High volume with price increase
+                factors['VOLUME'] = f"HIGH VOL BREAKOUT ({vol_ratio:.1f}x) +15"
+            elif vol_ratio > 1.5 and price_change < -1:
+                score -= 15  # High volume with price decrease
+                factors['VOLUME'] = f"HIGH VOL BREAKDOWN ({vol_ratio:.1f}x) -15"
+            elif vol_ratio > 1.2:
+                if price_change > 0:
+                    score += 8
+                    factors['VOLUME'] = f"ABOVE AVG VOL ({vol_ratio:.1f}x) +8"
+                else:
+                    score -= 8
+                    factors['VOLUME'] = f"ABOVE AVG VOL ({vol_ratio:.1f}x) -8"
+            else:
+                factors['VOLUME'] = f"NORMAL ({vol_ratio:.1f}x) +0"
+
+    # 6. Price Momentum (±15 points)
+    if len(df) >= 5:
+        momentum_5d = (close - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100 if df['close'].iloc[-5] > 0 else 0
+
+        if momentum_5d > 5:
+            score += 15  # Strong upward momentum
+            factors['MOMENTUM'] = f"STRONG UP ({momentum_5d:.1f}%) +15"
+        elif momentum_5d > 2:
+            score += 8  # Positive momentum
+            factors['MOMENTUM'] = f"POSITIVE ({momentum_5d:.1f}%) +8"
+        elif momentum_5d < -5:
+            score -= 15  # Strong downward momentum
+            factors['MOMENTUM'] = f"STRONG DOWN ({momentum_5d:.1f}%) -15"
+        elif momentum_5d < -2:
+            score -= 8  # Negative momentum
+            factors['MOMENTUM'] = f"NEGATIVE ({momentum_5d:.1f}%) -8"
+        else:
+            factors['MOMENTUM'] = f"FLAT ({momentum_5d:.1f}%) +0"
+
+    # Clamp score between 0 and 100
+    score = max(0, min(100, score))
+
+    return score, factors
+
+
 def analyze_stock(df):
     if df is None or len(df) < 20:
         return None
@@ -197,8 +362,14 @@ def analyze_stock(df):
         bb = BollingerBands(close=df['close'])
         df['bb_upper'] = bb.bollinger_hband()
         df['bb_lower'] = bb.bollinger_lband()
+        df['bb_middle'] = bb.bollinger_mavg()
 
         latest = df.iloc[-1]
+
+        # Calculate enhanced confidence score (0-100)
+        confidence_score, score_factors = calculate_confidence_score(df, latest)
+
+        # Original indicators for backward compatibility
         indicators = {}
         buy_score = sell_score = 0
 
@@ -247,13 +418,15 @@ def analyze_stock(df):
                 indicators['BB'] = "WITHIN BANDS"
 
         net = buy_score - sell_score
-        if net >= 3:
+
+        # Determine signal based on confidence score
+        if confidence_score >= 75:
             signal = "STRONG BUY"
-        elif net >= 1:
+        elif confidence_score >= 60:
             signal = "BUY"
-        elif net <= -3:
+        elif confidence_score <= 25:
             signal = "STRONG SELL"
-        elif net <= -1:
+        elif confidence_score <= 40:
             signal = "SELL"
         else:
             signal = "NEUTRAL"
@@ -265,44 +438,109 @@ def analyze_stock(df):
             "sma_50": sma50,
             "signal": signal,
             "strength": net,
-            "indicators": indicators
+            "confidence_score": confidence_score,
+            "score_factors": score_factors,
+            "indicators": indicators,
+            "volume": latest.get('volume'),
+            "bb_upper": bb_up,
+            "bb_lower": bb_low
         }
     except Exception as e:
         logger.error(f"Analysis error: {e}")
         return None
 
-# ===== CHART =====
+# ===== ENHANCED CHART GENERATION =====
 def generate_chart(symbol):
+    """Generate enhanced multi-panel chart with price, indicators, and volume"""
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         from ta.momentum import RSIIndicator
+        from ta.trend import MACD, SMAIndicator
+        from ta.volatility import BollingerBands
+        import numpy as np
 
-        df = get_stock_data(symbol)
+        df = get_stock_data(symbol, period="3mo")
         if df is None or len(df) < 20:
             return None
 
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+        # Calculate indicators
+        df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
+        macd = MACD(close=df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_hist'] = macd.macd_diff()
+        df['sma_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
+        df['sma_50'] = SMAIndicator(close=df['close'], window=50).sma_indicator()
+        bb = BollingerBands(close=df['close'])
+        df['bb_upper'] = bb.bollinger_hband()
+        df['bb_lower'] = bb.bollinger_lband()
+        df['bb_middle'] = bb.bollinger_mavg()
 
+        # Create figure with 4 subplots
+        fig, axes = plt.subplots(4, 1, figsize=(12, 14), gridspec_kw={'height_ratios': [3, 1, 1, 1]})
+        fig.suptitle(f'{symbol.upper()} - Technical Analysis Chart', fontsize=14, fontweight='bold')
+
+        # Panel 1: Price with Bollinger Bands and SMAs
         ax1 = axes[0]
-        ax1.set_title(f"{symbol.upper()} - Price Chart")
-        ax1.plot(df.index, df['close'], label='Close', color='blue')
-        ax1.legend()
+        ax1.plot(df.index, df['close'], label='Price', color='#2962FF', linewidth=1.5)
+        ax1.plot(df.index, df['sma_20'], label='SMA 20', color='#FF6D00', linewidth=1, alpha=0.8)
+        ax1.plot(df.index, df['sma_50'], label='SMA 50', color='#00C853', linewidth=1, alpha=0.8)
+        ax1.fill_between(df.index, df['bb_upper'], df['bb_lower'], alpha=0.1, color='blue', label='BB Bands')
+        ax1.plot(df.index, df['bb_upper'], color='gray', linewidth=0.5, linestyle='--')
+        ax1.plot(df.index, df['bb_lower'], color='gray', linewidth=0.5, linestyle='--')
+        ax1.set_ylabel('Price (₹)', fontweight='bold')
+        ax1.legend(loc='upper left', fontsize=8)
         ax1.grid(True, alpha=0.3)
+        ax1.set_title('Price with Bollinger Bands & Moving Averages', fontsize=10)
 
+        # Panel 2: Volume
         ax2 = axes[1]
-        rsi = RSIIndicator(close=df['close'], window=14).rsi()
-        ax2.plot(df.index, rsi, color='purple')
-        ax2.axhline(y=70, color='red', linestyle='--')
-        ax2.axhline(y=30, color='green', linestyle='--')
-        ax2.set_ylabel('RSI')
-        ax2.set_ylim(0, 100)
+        colors = ['green' if df['close'].iloc[i] >= df['close'].iloc[i-1] else 'red'
+                  for i in range(1, len(df))]
+        colors.insert(0, 'green')
+        ax2.bar(df.index, df['volume'], color=colors, alpha=0.7)
+        ax2.set_ylabel('Volume', fontweight='bold')
         ax2.grid(True, alpha=0.3)
+        ax2.set_title('Volume', fontsize=10)
+        # Add volume average line
+        vol_avg = df['volume'].rolling(window=20).mean()
+        ax2.plot(df.index, vol_avg, color='blue', linewidth=1, label='20-day Avg')
+
+        # Panel 3: RSI
+        ax3 = axes[2]
+        ax3.plot(df.index, df['rsi'], color='#7B1FA2', linewidth=1.5)
+        ax3.axhline(y=70, color='red', linestyle='--', alpha=0.7, label='Overbought (70)')
+        ax3.axhline(y=30, color='green', linestyle='--', alpha=0.7, label='Oversold (30)')
+        ax3.axhline(y=50, color='gray', linestyle='-', alpha=0.3)
+        ax3.fill_between(df.index, 70, 100, alpha=0.1, color='red')
+        ax3.fill_between(df.index, 0, 30, alpha=0.1, color='green')
+        ax3.set_ylabel('RSI', fontweight='bold')
+        ax3.set_ylim(0, 100)
+        ax3.legend(loc='upper left', fontsize=8)
+        ax3.grid(True, alpha=0.3)
+        ax3.set_title('RSI (14)', fontsize=10)
+
+        # Panel 4: MACD
+        ax4 = axes[3]
+        ax4.plot(df.index, df['macd'], label='MACD', color='#2962FF', linewidth=1)
+        ax4.plot(df.index, df['macd_signal'], label='Signal', color='#FF6D00', linewidth=1)
+        colors_hist = ['green' if val >= 0 else 'red' for val in df['macd_hist']]
+        ax4.bar(df.index, df['macd_hist'], color=colors_hist, alpha=0.5, label='Histogram')
+        ax4.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+        ax4.set_ylabel('MACD', fontweight='bold')
+        ax4.legend(loc='upper left', fontsize=8)
+        ax4.grid(True, alpha=0.3)
+        ax4.set_title('MACD (12, 26, 9)', fontsize=10)
+
+        # Format x-axis
+        for ax in axes:
+            ax.tick_params(axis='x', rotation=45)
 
         plt.tight_layout()
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
+        plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
         buf.seek(0)
         plt.close()
         return buf
@@ -310,24 +548,128 @@ def generate_chart(symbol):
         logger.error(f"Chart error: {e}")
         return None
 
+
+def generate_weekly_report_chart(stocks_data):
+    """Generate a comprehensive weekly report chart with multiple stocks comparison"""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        if not stocks_data:
+            return None
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Weekly Market Analysis Report', fontsize=16, fontweight='bold')
+
+        # Panel 1: Weekly Performance Bar Chart
+        ax1 = axes[0, 0]
+        symbols = [s['symbol'] for s in stocks_data]
+        weekly_returns = [s.get('weekly_return', 0) for s in stocks_data]
+        colors = ['green' if r >= 0 else 'red' for r in weekly_returns]
+        bars = ax1.bar(symbols, weekly_returns, color=colors, alpha=0.7)
+        ax1.axhline(y=0, color='black', linewidth=0.5)
+        ax1.set_ylabel('Weekly Return (%)', fontweight='bold')
+        ax1.set_title('Weekly Performance', fontsize=12)
+        ax1.tick_params(axis='x', rotation=45)
+        # Add value labels
+        for bar, val in zip(bars, weekly_returns):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                    f'{val:.1f}%', ha='center', va='bottom', fontsize=8)
+
+        # Panel 2: Confidence Scores
+        ax2 = axes[0, 1]
+        confidence_scores = [s.get('confidence_score', 50) for s in stocks_data]
+        colors_conf = []
+        for score in confidence_scores:
+            if score >= 70:
+                colors_conf.append('green')
+            elif score <= 30:
+                colors_conf.append('red')
+            else:
+                colors_conf.append('orange')
+        bars = ax2.barh(symbols, confidence_scores, color=colors_conf, alpha=0.7)
+        ax2.axvline(x=50, color='gray', linestyle='--', alpha=0.5)
+        ax2.axvline(x=70, color='green', linestyle='--', alpha=0.3)
+        ax2.axvline(x=30, color='red', linestyle='--', alpha=0.3)
+        ax2.set_xlim(0, 100)
+        ax2.set_xlabel('Confidence Score', fontweight='bold')
+        ax2.set_title('Signal Confidence (0-100)', fontsize=12)
+        # Add value labels
+        for bar, val in zip(bars, confidence_scores):
+            ax2.text(val + 2, bar.get_y() + bar.get_height()/2,
+                    f'{val:.0f}', ha='left', va='center', fontsize=9)
+
+        # Panel 3: RSI Comparison
+        ax3 = axes[1, 0]
+        rsi_values = [s.get('rsi', 50) for s in stocks_data]
+        colors_rsi = []
+        for rsi in rsi_values:
+            if rsi < 30:
+                colors_rsi.append('green')
+            elif rsi > 70:
+                colors_rsi.append('red')
+            else:
+                colors_rsi.append('blue')
+        ax3.bar(symbols, rsi_values, color=colors_rsi, alpha=0.7)
+        ax3.axhline(y=70, color='red', linestyle='--', alpha=0.5, label='Overbought')
+        ax3.axhline(y=30, color='green', linestyle='--', alpha=0.5, label='Oversold')
+        ax3.axhline(y=50, color='gray', linestyle='-', alpha=0.3)
+        ax3.set_ylabel('RSI', fontweight='bold')
+        ax3.set_ylim(0, 100)
+        ax3.set_title('RSI Comparison', fontsize=12)
+        ax3.tick_params(axis='x', rotation=45)
+        ax3.legend(fontsize=8)
+
+        # Panel 4: Signal Distribution Pie Chart
+        ax4 = axes[1, 1]
+        signals = [s.get('signal', 'NEUTRAL') for s in stocks_data]
+        signal_counts = {}
+        for sig in signals:
+            signal_counts[sig] = signal_counts.get(sig, 0) + 1
+        labels = list(signal_counts.keys())
+        sizes = list(signal_counts.values())
+        colors_pie = []
+        for label in labels:
+            if 'BUY' in label:
+                colors_pie.append('#4CAF50' if 'STRONG' in label else '#81C784')
+            elif 'SELL' in label:
+                colors_pie.append('#F44336' if 'STRONG' in label else '#E57373')
+            else:
+                colors_pie.append('#FFC107')
+        ax4.pie(sizes, labels=labels, colors=colors_pie, autopct='%1.0f%%', startangle=90)
+        ax4.set_title('Signal Distribution', fontsize=12)
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120, bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        return buf
+    except Exception as e:
+        logger.error(f"Weekly report chart error: {e}")
+        return None
+
 # ===== HANDLERS =====
 def handle_start(chat_id, user_name):
-    msg = f"""*Welcome to MarketBuddy!*
+    msg = f"""*Welcome to MarketBuddy Pro!*
 
-Hello {user_name}! I'm your personal stock analysis assistant.
+Hello {user_name}! I'm your AI-powered stock analysis assistant.
 
 *Available Commands:*
 
-/stock SYMBOL - Get detailed analysis
+/stock SYMBOL - Detailed analysis with confidence score
   Example: /stock RELIANCE or /stock TCS
 
 /price SYMBOL - Quick price check
 
-/chart SYMBOL - Get price chart with RSI
+/chart SYMBOL - Enhanced technical chart
+  (Price, Volume, RSI, MACD, Bollinger Bands)
 
-/summary - Get NIFTY & SENSEX summary
+/summary - Get NIFTY, SENSEX & BANKNIFTY
 
-/news - Get latest market news
+/news - Latest market news
 
 /watchlist - View your watchlist
 /watchlist add SYMBOL - Add stock
@@ -341,14 +683,20 @@ Hello {user_name}! I'm your personal stock analysis assistant.
 
 /help - Show this help message
 
-*Features:*
-  Technical Analysis (RSI, MACD, SMA, Bollinger)
-  Anomaly Detection
-  7-Day Price Forecast
-  Automatic Buy Alerts (every 5 min)
-  Daily Summary (8 AM)
+*New Features:*
+  Advanced Confidence Score (0-100)
+  6-Factor Analysis (RSI, MACD, SMA, BB, Volume, Momentum)
+  High-Confidence Alerts (score >= 70)
+  Enhanced Multi-Panel Charts
 
-Start by typing `/stock RELIANCE` to see it in action!"""
+*Automatic Alerts:*
+  Market Open/Close (9:15 AM / 3:30 PM)
+  Morning & Afternoon Updates (10:30 AM / 1:30 PM)
+  High Confidence Opportunities (every 15 min)
+  Breaking News Alerts (every 10 min)
+  Weekly Report (Saturday 6 PM)
+
+Start with `/stock RELIANCE` to see the analysis!"""
     send_message(chat_id, msg)
 
 def handle_price(chat_id, symbol):
@@ -391,24 +739,48 @@ def handle_stock(chat_id, symbol):
     change = price - prev
     pct = (change / prev * 100) if prev else 0
 
+    # Confidence score emoji
+    conf_score = analysis.get('confidence_score', 50)
+    if conf_score >= 75:
+        score_emoji = "🟢🟢🟢"
+    elif conf_score >= 60:
+        score_emoji = "🟢🟢"
+    elif conf_score <= 25:
+        score_emoji = "🔴🔴🔴"
+    elif conf_score <= 40:
+        score_emoji = "🔴🔴"
+    else:
+        score_emoji = "🟡"
+
     msg = f"""*{info.get('name', symbol)}*
 
-*Price:* Rs {price:,.2f}
+*Price:* ₹{price:,.2f}
 *Change:* {change:+,.2f} ({pct:+.2f}%)
 
 *SIGNAL: {analysis['signal']}*
+*Confidence Score: {conf_score}/100* {score_emoji}
 
-*Indicators:*
+*Score Breakdown:*
 """
-    for ind, val in analysis['indicators'].items():
-        msg += f"- {ind}: {val}\n"
+    # Add score factors
+    score_factors = analysis.get('score_factors', {})
+    for factor, detail in score_factors.items():
+        msg += f"  • {factor}: {detail}\n"
 
     msg += f"""
-*More Info:*
-- 52W High: Rs {info.get('52w_high', 0):,.2f}
-- 52W Low: Rs {info.get('52w_low', 0):,.2f}
-- P/E: {info.get('pe_ratio', 0):.2f}
-- Sector: {info.get('sector', 'N/A')}"""
+*Technical Indicators:*
+"""
+    for ind, val in analysis['indicators'].items():
+        msg += f"  • {ind}: {val}\n"
+
+    msg += f"""
+*Stock Info:*
+  • 52W High: ₹{info.get('52w_high', 0):,.2f}
+  • 52W Low: ₹{info.get('52w_low', 0):,.2f}
+  • P/E: {info.get('pe_ratio', 0):.2f}
+  • Sector: {info.get('sector', 'N/A')}
+
+_Not financial advice_"""
 
     send_message(chat_id, msg)
 
@@ -677,7 +1049,7 @@ _Source: {article.get('source', {}).get('name', 'Unknown')}_"""
 
 
 def check_strong_signals():
-    """Check watchlist for strong buy/sell signals"""
+    """Check watchlist for strong buy/sell signals based on confidence score"""
     try:
         strong_alerts = []
 
@@ -690,46 +1062,248 @@ def check_strong_signals():
             if not analysis:
                 continue
 
-            # Only alert on STRONG signals (strength >= 3 or <= -3)
-            strength = analysis.get('strength', 0)
+            # Use new confidence score (>=70 for buy, <=30 for sell)
+            confidence = analysis.get('confidence_score', 50)
             signal = analysis.get('signal', '')
 
-            if strength >= 3:  # Strong Buy
+            if confidence >= 70:  # High confidence buy
                 info = get_stock_info(sym)
                 price = info.get('price', 0) if info else 0
                 strong_alerts.append({
                     'symbol': sym,
-                    'signal': '🟢 STRONG BUY',
+                    'signal': '🟢 HIGH CONFIDENCE BUY',
                     'price': price,
                     'rsi': analysis.get('rsi', 0),
-                    'strength': strength
+                    'confidence': confidence,
+                    'score_factors': analysis.get('score_factors', {})
                 })
-            elif strength <= -3:  # Strong Sell
+            elif confidence <= 30:  # High confidence sell
                 info = get_stock_info(sym)
                 price = info.get('price', 0) if info else 0
                 strong_alerts.append({
                     'symbol': sym,
-                    'signal': '🔴 STRONG SELL',
+                    'signal': '🔴 HIGH CONFIDENCE SELL',
                     'price': price,
                     'rsi': analysis.get('rsi', 0),
-                    'strength': strength
+                    'confidence': confidence,
+                    'score_factors': analysis.get('score_factors', {})
                 })
 
         if strong_alerts:
-            msg = "🚨 *STRONG SIGNAL ALERT*\n\n"
+            msg = "🚨 *HIGH CONFIDENCE SIGNAL ALERT*\n\n"
             for alert in strong_alerts[:3]:  # Max 3 alerts
+                rsi_val = alert.get('rsi')
+                rsi_str = f"{rsi_val:.1f}" if rsi_val and rsi_val > 0 else "N/A"
                 msg += f"""*{alert['symbol']}* - {alert['signal']}
   Price: ₹{alert['price']:,.2f}
-  RSI: {alert['rsi']:.1f}
-  Strength: {alert['strength']}
+  Confidence: {alert['confidence']}/100
+  RSI: {rsi_str}
 
+  Key Factors:
 """
+                for factor, detail in list(alert['score_factors'].items())[:3]:
+                    msg += f"    • {factor}: {detail}\n"
+                msg += "\n"
+
             msg += "_This is not financial advice. Do your own research._"
             send_message(ADMIN_CHAT_ID, msg)
-            logger.info(f"Strong signals alert sent: {len(strong_alerts)} stocks")
+            logger.info(f"High confidence alerts sent: {len(strong_alerts)} stocks")
 
     except Exception as e:
         logger.error(f"Strong signals check error: {e}")
+
+
+def check_high_confidence_alerts():
+    """
+    Check for high-confidence opportunities (score >= 70) and send alerts.
+    This is triggered every 15 minutes during market hours.
+    """
+    global last_scheduled_alert
+    try:
+        now = datetime.now(IST)
+        today_key = now.strftime('%Y-%m-%d-%H')  # Hourly key to limit alerts
+
+        high_conf_alerts = []
+
+        # Check extended watchlist for high confidence
+        extended_watchlist = DEFAULT_WATCHLIST + ["SBIN", "BAJFINANCE", "LT", "MARUTI", "WIPRO"]
+
+        for sym in extended_watchlist:
+            df = get_stock_data(sym, period="1mo")
+            if df is None:
+                continue
+
+            analysis = analyze_stock(df)
+            if not analysis:
+                continue
+
+            confidence = analysis.get('confidence_score', 50)
+
+            # Only alert if confidence >= 70 (strong buy signal)
+            if confidence >= 70:
+                # Check if we already sent alert for this stock today
+                alert_key = f"high_conf_{sym}_{today_key}"
+                if last_scheduled_alert.get(alert_key):
+                    continue
+
+                info = get_stock_info(sym)
+                price = info.get('price', 0) if info else 0
+                prev = info.get('previous_close', price) if info else price
+                change_pct = ((price - prev) / prev * 100) if prev else 0
+
+                high_conf_alerts.append({
+                    'symbol': sym,
+                    'price': price,
+                    'change_pct': change_pct,
+                    'confidence': confidence,
+                    'signal': analysis.get('signal', ''),
+                    'rsi': analysis.get('rsi', 50),
+                    'score_factors': analysis.get('score_factors', {})
+                })
+                last_scheduled_alert[alert_key] = True
+
+        if high_conf_alerts:
+            # Sort by confidence score
+            high_conf_alerts.sort(key=lambda x: x['confidence'], reverse=True)
+
+            msg = f"""🎯 *HIGH CONFIDENCE OPPORTUNITY ALERT*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+Found {len(high_conf_alerts)} stock(s) with confidence score >= 70!
+
+"""
+            for alert in high_conf_alerts[:5]:  # Max 5 alerts
+                emoji = "🟢🟢🟢" if alert['confidence'] >= 85 else "🟢🟢"
+                rsi_val = alert.get('rsi')
+                rsi_str = f"{rsi_val:.1f}" if rsi_val and rsi_val > 0 else "N/A"
+                msg += f"""*{alert['symbol']}* {emoji}
+  Signal: {alert['signal']}
+  Confidence: *{alert['confidence']}/100*
+  Price: ₹{alert['price']:,.2f} ({alert['change_pct']:+.2f}%)
+  RSI: {rsi_str}
+  Top Factors:
+"""
+                for factor, detail in list(alert['score_factors'].items())[:2]:
+                    msg += f"    • {factor}: {detail}\n"
+                msg += "\n"
+
+            msg += "_Do your own research before investing._"
+            send_message(ADMIN_CHAT_ID, msg)
+            logger.info(f"High confidence alerts sent: {len(high_conf_alerts)} stocks")
+
+    except Exception as e:
+        logger.error(f"High confidence check error: {e}")
+
+
+def send_weekly_report():
+    """
+    Send comprehensive weekly market analysis report every Saturday at 6 PM IST.
+    Includes analysis of watchlist stocks with charts.
+    """
+    try:
+        now = datetime.now(IST)
+
+        msg = f"""📊 *WEEKLY MARKET ANALYSIS REPORT*
+_{now.strftime('%A, %B %d, %Y')}_
+
+"""
+        # Collect data for all watchlist stocks
+        stocks_data = []
+
+        msg += "*WATCHLIST ANALYSIS:*\n\n"
+
+        for sym in DEFAULT_WATCHLIST:
+            df = get_stock_data(sym, period="1mo")
+            if df is None:
+                continue
+
+            analysis = analyze_stock(df)
+            info = get_stock_info(sym)
+
+            if not analysis:
+                continue
+
+            # Get current price
+            current_price = analysis.get('price', 0)
+            if not current_price:
+                current_price = info.get('price', 0) if info else 0
+
+            # Calculate weekly return
+            if len(df) >= 5 and current_price > 0:
+                week_ago_price = df['close'].iloc[-5]
+                weekly_return = ((current_price - week_ago_price) / week_ago_price * 100) if week_ago_price > 0 else 0
+            else:
+                weekly_return = 0
+
+            confidence = analysis.get('confidence_score', 50)
+            signal = analysis.get('signal', 'NEUTRAL')
+            rsi = analysis.get('rsi', 50)
+
+            # Store for chart
+            stocks_data.append({
+                'symbol': sym,
+                'price': current_price,
+                'weekly_return': weekly_return,
+                'confidence_score': confidence,
+                'signal': signal,
+                'rsi': rsi if rsi else 50
+            })
+
+            # Signal emoji
+            if confidence >= 70:
+                sig_emoji = "🟢🟢🟢"
+            elif confidence >= 60:
+                sig_emoji = "🟢"
+            elif confidence <= 30:
+                sig_emoji = "🔴🔴🔴"
+            elif confidence <= 40:
+                sig_emoji = "🔴"
+            else:
+                sig_emoji = "🟡"
+
+            msg += f"""*{sym}* {sig_emoji}
+  Price: ₹{current_price:,.2f}
+  Week Return: {weekly_return:+.2f}%
+  Signal: {signal}
+  Confidence: {confidence}/100
+  RSI: {rsi:.1f if rsi else 'N/A'}
+
+"""
+
+        # Index summary
+        msg += "*INDICES WEEKLY SUMMARY:*\n"
+        for idx in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+            data = get_index_data(idx)
+            if data:
+                emoji = "📈" if data.get('change', 0) >= 0 else "📉"
+                msg += f"{emoji} *{idx}*: {data.get('value', 0):,.2f} ({data.get('pct', 0):+.2f}%)\n"
+
+        # Top picks summary
+        if stocks_data:
+            # Sort by confidence for top picks
+            sorted_by_conf = sorted(stocks_data, key=lambda x: x['confidence_score'], reverse=True)
+            top_buys = [s for s in sorted_by_conf if s['confidence_score'] >= 60][:3]
+
+            if top_buys:
+                msg += "\n*TOP PICKS THIS WEEK:*\n"
+                for pick in top_buys:
+                    msg += f"  🎯 {pick['symbol']} (Confidence: {pick['confidence_score']}/100)\n"
+
+        msg += "\n_Have a great weekend! See you on Monday._"
+
+        # Send text report
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info("Weekly report text sent")
+
+        # Generate and send chart
+        if stocks_data:
+            chart = generate_weekly_report_chart(stocks_data)
+            if chart:
+                send_photo(ADMIN_CHAT_ID, chart, "Weekly Analysis Chart")
+                logger.info("Weekly report chart sent")
+
+    except Exception as e:
+        logger.error(f"Weekly report error: {e}")
 
 
 def run_scheduler():
@@ -746,10 +1320,19 @@ def run_scheduler():
             current_day = now.weekday()  # 0=Monday, 6=Sunday
             today_key = now.strftime('%Y-%m-%d')
 
-            # Skip weekends
+            # ===== SATURDAY WEEKLY REPORT =====
+            # Send weekly report on Saturday at 6 PM IST
+            if current_day == 5 and current_hour == 18 and current_minute == 0:
+                if last_scheduled_alert.get('weekly_report') != today_key:
+                    send_weekly_report()
+                    last_scheduled_alert['weekly_report'] = today_key
+
+            # Skip rest of alerts on weekends (except weekly report above)
             if current_day >= 5:  # Saturday or Sunday
                 time.sleep(60)
                 continue
+
+            # ===== WEEKDAY ALERTS =====
 
             # Market Open Alert - 9:15 AM
             if current_hour == 9 and current_minute == 15:
@@ -782,6 +1365,11 @@ def run_scheduler():
             # Check strong signals every 30 minutes during market hours
             if current_minute % 30 == 0 and 9 <= current_hour < 16:
                 check_strong_signals()
+
+            # ===== NEW: HIGH CONFIDENCE ALERTS =====
+            # Check for high confidence opportunities every 15 minutes during market hours
+            if current_minute % 15 == 0 and 9 <= current_hour < 16:
+                check_high_confidence_alerts()
 
             time.sleep(60)  # Check every minute
 

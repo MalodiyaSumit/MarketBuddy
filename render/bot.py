@@ -121,7 +121,7 @@ DEFAULT_WATCHLIST = [
     # Metal & Mining
     "TATASTEEL", "HINDALCO", "COALINDIA",
     # Energy & Power
-    "ONGC", "NTPC", "TATAPOWER", "RELPOWER",
+    "ONGC", "NTPC", "TATAPOWER", "RPOWER",
     # Infrastructure
     "LT", "ULTRACEMCO", "BHEL",
     # Auto

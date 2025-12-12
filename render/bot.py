@@ -8,7 +8,7 @@ import requests
 import logging
 import time
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask
 import threading
 import pytz
@@ -37,15 +37,28 @@ last_news_check = 0
 last_scheduled_alert = {}
 sent_news_ids = set()
 
+# ===== ACTIVE SIGNALS TRACKING =====
+# Store active signals for target hit monitoring
+active_signals = {}  # {signal_id: signal_data}
+trade_history = []  # Store completed trades for learning
+market_mistakes = []  # Track mistakes for improvement
+
 # Indian Indices
 INDIAN_INDICES = {
     "NIFTY": "^NSEI", "NIFTY50": "^NSEI",
     "SENSEX": "^BSESN",
     "BANKNIFTY": "^NSEBANK",
+    "GIFTNIFTY": "NIFTY_FUT.NS",  # Gift Nifty proxy
 }
 
-# Default Watchlist
+# Index watchlist for signal generation
+INDEX_WATCHLIST = ["NIFTY", "BANKNIFTY", "SENSEX"]
+
+# Default Watchlist (stocks)
 DEFAULT_WATCHLIST = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"]
+
+# Combined watchlist for signal monitoring
+FULL_WATCHLIST = DEFAULT_WATCHLIST + INDEX_WATCHLIST
 
 # User Data Storage
 user_data = {}
@@ -163,6 +176,385 @@ def get_index_data(index_name="NIFTY"):
     except Exception as e:
         logger.error(f"Index error: {e}")
     return {}
+
+def get_gift_nifty_data():
+    """
+    Fetch Gift Nifty (SGX Nifty) data.
+    Gift Nifty trades on SGX from 6:30 AM to 11:30 PM IST.
+    """
+    try:
+        import yfinance as yf
+        # Try multiple symbols for Gift Nifty / SGX Nifty
+        symbols_to_try = ["^NSEI", "NQ=F"]  # Fallback to Nifty if SGX not available
+
+        for sym in symbols_to_try:
+            try:
+                ticker = yf.Ticker(sym)
+                hist = ticker.history(period="5d", interval="1h")
+                if hist.empty:
+                    continue
+
+                # Get today's data
+                today = datetime.now(IST).date()
+                today_data = hist[hist.index.date == today] if hasattr(hist.index, 'date') else hist.tail(8)
+
+                if len(today_data) > 0:
+                    high = float(today_data['High'].max())
+                    low = float(today_data['Low'].min())
+                    current = float(today_data['Close'].iloc[-1])
+                    open_price = float(today_data['Open'].iloc[0])
+                else:
+                    # Use last available data
+                    high = float(hist['High'].iloc[-1])
+                    low = float(hist['Low'].iloc[-1])
+                    current = float(hist['Close'].iloc[-1])
+                    open_price = float(hist['Open'].iloc[-1])
+
+                change = current - open_price
+                pct = (change / open_price * 100) if open_price else 0
+
+                return {
+                    "name": "GIFT NIFTY",
+                    "current": current,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "change": change,
+                    "pct": pct,
+                    "range": high - low,
+                }
+            except:
+                continue
+
+    except Exception as e:
+        logger.error(f"Gift Nifty error: {e}")
+    return None
+
+
+# ===== ACTIVE SIGNAL MANAGEMENT =====
+
+def create_active_signal(symbol, signal_type, entry_price, target_1, target_2, stop_loss,
+                         timeframe, confidence, methodology=None):
+    """
+    Create and store an active signal for target hit monitoring.
+    """
+    global active_signals
+
+    now = datetime.now(IST)
+    signal_id = f"{symbol}_{now.strftime('%Y%m%d_%H%M%S')}"
+
+    # Parse timeframe to set expiry
+    if "intraday" in timeframe.lower() or "1-2 days" in timeframe.lower():
+        expiry_hours = 8  # Same day or next day
+    elif "3-5 days" in timeframe.lower() or "1 week" in timeframe.lower():
+        expiry_hours = 5 * 24  # 5 days
+    elif "1-2 weeks" in timeframe.lower():
+        expiry_hours = 14 * 24  # 2 weeks
+    else:
+        expiry_hours = 24  # Default 1 day
+
+    signal_data = {
+        "id": signal_id,
+        "symbol": symbol,
+        "type": signal_type,  # BUY or SELL
+        "entry_price": entry_price,
+        "target_1": target_1,
+        "target_2": target_2,
+        "stop_loss": stop_loss,
+        "timeframe": timeframe,
+        "confidence": confidence,
+        "created_at": now,
+        "expiry_at": now + timedelta(hours=expiry_hours),
+        "status": "ACTIVE",  # ACTIVE, TARGET_1_HIT, TARGET_2_HIT, STOP_LOSS_HIT, EXPIRED
+        "target_1_hit_at": None,
+        "target_2_hit_at": None,
+        "stop_loss_hit_at": None,
+        "highest_price": entry_price if signal_type == "BUY" else entry_price,
+        "lowest_price": entry_price if signal_type == "SELL" else entry_price,
+        "methodology": methodology or {}
+    }
+
+    active_signals[signal_id] = signal_data
+    logger.info(f"Created active signal: {signal_id}")
+    return signal_id
+
+
+def check_signal_targets():
+    """
+    Check all active signals for target hits or stop loss hits.
+    Send notifications when targets are achieved.
+    """
+    global active_signals, trade_history, market_mistakes
+
+    now = datetime.now(IST)
+    signals_to_remove = []
+
+    for signal_id, signal in active_signals.items():
+        if signal["status"] not in ["ACTIVE", "TARGET_1_HIT"]:
+            continue
+
+        # Check if expired
+        if now > signal["expiry_at"]:
+            signal["status"] = "EXPIRED"
+
+            # Record as potential mistake if no target hit
+            if signal.get("target_1_hit_at") is None:
+                record_trade_result(signal, "EXPIRED", "Signal expired without hitting any target")
+
+            signals_to_remove.append(signal_id)
+            send_signal_expired_notification(signal)
+            continue
+
+        # Get current price
+        try:
+            symbol = signal["symbol"]
+            if symbol in INDEX_WATCHLIST:
+                data = get_index_data(symbol)
+                current_price = data.get("value", 0) if data else 0
+            else:
+                info = get_stock_info(symbol)
+                current_price = info.get("price", 0) if info else 0
+
+            if current_price <= 0:
+                continue
+
+            # Update highest/lowest prices
+            if signal["type"] == "BUY":
+                signal["highest_price"] = max(signal["highest_price"], current_price)
+            else:
+                signal["lowest_price"] = min(signal["lowest_price"], current_price)
+
+            # Check for BUY signal targets
+            if signal["type"] == "BUY":
+                # Check Stop Loss
+                if current_price <= signal["stop_loss"]:
+                    signal["status"] = "STOP_LOSS_HIT"
+                    signal["stop_loss_hit_at"] = now
+                    record_trade_result(signal, "STOP_LOSS", f"Price hit stop loss at ₹{current_price:,.2f}")
+                    send_stop_loss_hit_notification(signal, current_price)
+                    signals_to_remove.append(signal_id)
+                    continue
+
+                # Check Target 2 (if Target 1 already hit)
+                if signal["status"] == "TARGET_1_HIT" and current_price >= signal["target_2"]:
+                    signal["status"] = "TARGET_2_HIT"
+                    signal["target_2_hit_at"] = now
+                    record_trade_result(signal, "TARGET_2_HIT", f"Price hit Target 2 at ₹{current_price:,.2f}")
+                    send_target_hit_notification(signal, 2, current_price)
+                    signals_to_remove.append(signal_id)
+                    continue
+
+                # Check Target 1
+                if signal["status"] == "ACTIVE" and current_price >= signal["target_1"]:
+                    signal["status"] = "TARGET_1_HIT"
+                    signal["target_1_hit_at"] = now
+                    send_target_hit_notification(signal, 1, current_price)
+                    # Don't remove - continue monitoring for Target 2
+
+            # Check for SELL signal targets
+            elif signal["type"] == "SELL":
+                # Check Stop Loss (price goes up for sell)
+                if current_price >= signal["stop_loss"]:
+                    signal["status"] = "STOP_LOSS_HIT"
+                    signal["stop_loss_hit_at"] = now
+                    record_trade_result(signal, "STOP_LOSS", f"Price hit stop loss at ₹{current_price:,.2f}")
+                    send_stop_loss_hit_notification(signal, current_price)
+                    signals_to_remove.append(signal_id)
+                    continue
+
+                # Check Target 2
+                if signal["status"] == "TARGET_1_HIT" and current_price <= signal["target_2"]:
+                    signal["status"] = "TARGET_2_HIT"
+                    signal["target_2_hit_at"] = now
+                    record_trade_result(signal, "TARGET_2_HIT", f"Price hit Target 2 at ₹{current_price:,.2f}")
+                    send_target_hit_notification(signal, 2, current_price)
+                    signals_to_remove.append(signal_id)
+                    continue
+
+                # Check Target 1
+                if signal["status"] == "ACTIVE" and current_price <= signal["target_1"]:
+                    signal["status"] = "TARGET_1_HIT"
+                    signal["target_1_hit_at"] = now
+                    send_target_hit_notification(signal, 1, current_price)
+
+        except Exception as e:
+            logger.error(f"Error checking signal {signal_id}: {e}")
+
+    # Remove completed signals
+    for signal_id in signals_to_remove:
+        if signal_id in active_signals:
+            # Move to history before removing
+            trade_history.append(active_signals[signal_id])
+            del active_signals[signal_id]
+
+    # Keep only last 100 trades in history
+    if len(trade_history) > 100:
+        trade_history = trade_history[-100:]
+
+
+def record_trade_result(signal, result_type, notes=""):
+    """
+    Record trade result for learning and mistake tracking.
+    """
+    global market_mistakes
+
+    result = {
+        "signal_id": signal["id"],
+        "symbol": signal["symbol"],
+        "type": signal["type"],
+        "result": result_type,
+        "entry_price": signal["entry_price"],
+        "target_1": signal["target_1"],
+        "target_2": signal["target_2"],
+        "stop_loss": signal["stop_loss"],
+        "confidence": signal["confidence"],
+        "created_at": signal["created_at"].isoformat() if isinstance(signal["created_at"], datetime) else signal["created_at"],
+        "closed_at": datetime.now(IST).isoformat(),
+        "notes": notes,
+        "highest_price": signal.get("highest_price", signal["entry_price"]),
+        "lowest_price": signal.get("lowest_price", signal["entry_price"]),
+    }
+
+    # If stop loss hit or expired without target, record as potential mistake
+    if result_type in ["STOP_LOSS", "EXPIRED"]:
+        mistake = {
+            "date": datetime.now(IST).strftime("%Y-%m-%d"),
+            "symbol": signal["symbol"],
+            "signal_type": signal["type"],
+            "confidence": signal["confidence"],
+            "what_went_wrong": notes,
+            "lesson": f"Signal with confidence {signal['confidence']} failed. Review indicators."
+        }
+        market_mistakes.append(mistake)
+
+        # Keep only last 50 mistakes
+        if len(market_mistakes) > 50:
+            market_mistakes = market_mistakes[-50:]
+
+    logger.info(f"Recorded trade result: {signal['symbol']} - {result_type}")
+
+
+def send_target_hit_notification(signal, target_num, current_price):
+    """Send notification when target is hit."""
+    target_price = signal["target_1"] if target_num == 1 else signal["target_2"]
+
+    if signal["type"] == "BUY":
+        profit_pct = ((current_price - signal["entry_price"]) / signal["entry_price"]) * 100
+        profit_amount = current_price - signal["entry_price"]
+    else:
+        profit_pct = ((signal["entry_price"] - current_price) / signal["entry_price"]) * 100
+        profit_amount = signal["entry_price"] - current_price
+
+    time_taken = datetime.now(IST) - signal["created_at"]
+    hours = time_taken.total_seconds() / 3600
+
+    emoji = "🎯🎯" if target_num == 2 else "🎯"
+
+    msg = f"""{emoji} *TARGET {target_num} HIT!* {emoji}
+
+*{signal['symbol']}* - {signal['type']} Signal SUCCESS!
+
+✅ *Entry Price:* ₹{signal['entry_price']:,.2f}
+✅ *Target {target_num}:* ₹{target_price:,.2f}
+✅ *Current Price:* ₹{current_price:,.2f}
+
+💰 *Profit:* ₹{profit_amount:,.2f} ({profit_pct:+.2f}%)
+⏱️ *Time Taken:* {hours:.1f} hours
+
+*Signal Details:*
+  • Confidence: {signal['confidence']}/100
+  • Timeframe: {signal['timeframe']}
+  • Stop Loss was: ₹{signal['stop_loss']:,.2f}
+
+"""
+
+    if target_num == 1:
+        msg += f"""🔔 *Next Target:* ₹{signal['target_2']:,.2f}
+Continue monitoring for Target 2!
+
+💡 *Tip:* Consider booking partial profits and trailing stop loss."""
+    else:
+        msg += """🏆 *TRADE COMPLETED SUCCESSFULLY!*
+
+Great analysis! Both targets achieved."""
+
+    send_message(ADMIN_CHAT_ID, msg)
+    logger.info(f"Target {target_num} hit notification sent for {signal['symbol']}")
+
+
+def send_stop_loss_hit_notification(signal, current_price):
+    """Send notification when stop loss is hit."""
+    if signal["type"] == "BUY":
+        loss_pct = ((current_price - signal["entry_price"]) / signal["entry_price"]) * 100
+        loss_amount = signal["entry_price"] - current_price
+    else:
+        loss_pct = ((signal["entry_price"] - current_price) / signal["entry_price"]) * 100
+        loss_amount = current_price - signal["entry_price"]
+
+    msg = f"""🛑 *STOP LOSS HIT!*
+
+*{signal['symbol']}* - {signal['type']} Signal STOPPED OUT
+
+❌ *Entry Price:* ₹{signal['entry_price']:,.2f}
+❌ *Stop Loss:* ₹{signal['stop_loss']:,.2f}
+❌ *Exit Price:* ₹{current_price:,.2f}
+
+📉 *Loss:* ₹{loss_amount:,.2f} ({loss_pct:.2f}%)
+
+*Signal Details:*
+  • Confidence was: {signal['confidence']}/100
+  • Target 1 was: ₹{signal['target_1']:,.2f}
+  • Target 2 was: ₹{signal['target_2']:,.2f}
+
+📝 *Learning:* This signal did not work. Adding to mistake tracker for analysis.
+
+_Risk management protected from larger losses._"""
+
+    send_message(ADMIN_CHAT_ID, msg)
+    logger.info(f"Stop loss notification sent for {signal['symbol']}")
+
+
+def send_signal_expired_notification(signal):
+    """Send notification when signal expires without hitting target."""
+    # Get current price
+    try:
+        if signal["symbol"] in INDEX_WATCHLIST:
+            data = get_index_data(signal["symbol"])
+            current_price = data.get("value", 0) if data else 0
+        else:
+            info = get_stock_info(signal["symbol"])
+            current_price = info.get("price", 0) if info else 0
+    except:
+        current_price = signal["entry_price"]
+
+    if signal["type"] == "BUY":
+        change_pct = ((current_price - signal["entry_price"]) / signal["entry_price"]) * 100
+    else:
+        change_pct = ((signal["entry_price"] - current_price) / signal["entry_price"]) * 100
+
+    target_1_status = "✅ HIT" if signal.get("target_1_hit_at") else "❌ Not Hit"
+
+    msg = f"""⏰ *SIGNAL EXPIRED*
+
+*{signal['symbol']}* - {signal['type']} Signal EXPIRED
+
+📊 *Entry Price:* ₹{signal['entry_price']:,.2f}
+📊 *Current Price:* ₹{current_price:,.2f}
+📊 *Change:* {change_pct:+.2f}%
+
+*Target Status:*
+  • Target 1 (₹{signal['target_1']:,.2f}): {target_1_status}
+  • Target 2 (₹{signal['target_2']:,.2f}): ❌ Not Hit
+
+*Signal Info:*
+  • Confidence: {signal['confidence']}/100
+  • Timeframe: {signal['timeframe']}
+  • Duration: {signal['timeframe']}
+
+📝 *Learning:* Signal expired within timeframe. Review for next time."""
+
+    send_message(ADMIN_CHAT_ID, msg)
+    logger.info(f"Signal expired notification sent for {signal['symbol']}")
 
 def get_market_news(limit=5):
     try:
@@ -443,10 +835,196 @@ def analyze_stock(df):
             "indicators": indicators,
             "volume": latest.get('volume'),
             "bb_upper": bb_up,
-            "bb_lower": bb_low
+            "bb_lower": bb_low,
+            "bb_middle": latest.get('bb_middle'),
+            "df": df  # Pass dataframe for advanced calculations
         }
     except Exception as e:
         logger.error(f"Analysis error: {e}")
+        return None
+
+
+def calculate_trading_levels(df, analysis, info):
+    """
+    Calculate entry, target, stop loss levels with timeframe recommendation.
+
+    Methodology:
+    - Stop Loss: Based on ATR (Average True Range) or recent swing low/high
+    - Target 1: Based on Risk:Reward 1:1.5
+    - Target 2: Based on Risk:Reward 1:2.5
+    - Timeframe: Based on volatility and trend strength
+    """
+    import pandas as pd
+    import numpy as np
+
+    try:
+        close = analysis['price']
+        signal = analysis['signal']
+        confidence = analysis.get('confidence_score', 50)
+        bb_upper = analysis.get('bb_upper', close * 1.02)
+        bb_lower = analysis.get('bb_lower', close * 0.98)
+        bb_middle = analysis.get('bb_middle', close)
+        sma_20 = analysis.get('sma_20', close)
+        sma_50 = analysis.get('sma_50', close)
+
+        # Calculate ATR (Average True Range) for volatility-based stop loss
+        if len(df) >= 14:
+            high = df['high']
+            low = df['low']
+            close_prev = df['close'].shift(1)
+
+            tr1 = high - low
+            tr2 = abs(high - close_prev)
+            tr3 = abs(low - close_prev)
+
+            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = true_range.rolling(window=14).mean().iloc[-1]
+        else:
+            atr = close * 0.02  # Default 2% if not enough data
+
+        # Calculate recent swing high/low (last 20 days)
+        recent_high = df['high'].iloc[-20:].max() if len(df) >= 20 else close * 1.05
+        recent_low = df['low'].iloc[-20:].min() if len(df) >= 20 else close * 0.95
+
+        # Calculate support and resistance levels
+        support_1 = bb_lower  # Bollinger Lower Band
+        support_2 = recent_low  # Recent Swing Low
+        resistance_1 = bb_upper  # Bollinger Upper Band
+        resistance_2 = recent_high  # Recent Swing High
+
+        # Determine if BUY or SELL signal
+        is_buy_signal = 'BUY' in signal
+        is_sell_signal = 'SELL' in signal
+
+        if is_buy_signal:
+            # BUY Signal Calculations
+            entry_price = close
+
+            # Stop Loss: Below recent swing low or 1.5x ATR below entry
+            stop_loss_atr = close - (1.5 * atr)
+            stop_loss_swing = min(support_1, support_2) * 0.995  # Slightly below support
+            stop_loss = max(stop_loss_atr, stop_loss_swing)  # Use the higher (less risky) stop
+
+            # Risk calculation
+            risk = entry_price - stop_loss
+
+            # Target prices based on Risk:Reward ratios
+            target_1 = entry_price + (risk * 1.5)  # R:R = 1:1.5
+            target_2 = entry_price + (risk * 2.5)  # R:R = 1:2.5
+            target_3 = min(resistance_1, resistance_2)  # Resistance level
+
+            # Ensure targets are realistic
+            target_1 = max(target_1, entry_price * 1.02)  # At least 2% gain
+            target_2 = max(target_2, entry_price * 1.05)  # At least 5% gain
+
+            action = "BUY"
+
+        elif is_sell_signal:
+            # SELL Signal Calculations (for short selling or exit)
+            entry_price = close
+
+            # Stop Loss: Above recent swing high or 1.5x ATR above entry
+            stop_loss_atr = close + (1.5 * atr)
+            stop_loss_swing = max(resistance_1, resistance_2) * 1.005  # Slightly above resistance
+            stop_loss = min(stop_loss_atr, stop_loss_swing)  # Use the lower (less risky) stop
+
+            # Risk calculation
+            risk = stop_loss - entry_price
+
+            # Target prices (downside targets for sell)
+            target_1 = entry_price - (risk * 1.5)  # R:R = 1:1.5
+            target_2 = entry_price - (risk * 2.5)  # R:R = 1:2.5
+            target_3 = max(support_1, support_2)  # Support level
+
+            # Ensure targets are realistic
+            target_1 = min(target_1, entry_price * 0.98)  # At least 2% drop
+            target_2 = min(target_2, entry_price * 0.95)  # At least 5% drop
+
+            action = "SELL"
+
+        else:
+            # NEUTRAL - No clear trade setup
+            return None
+
+        # Calculate Risk:Reward Ratio
+        if is_buy_signal:
+            risk_amount = entry_price - stop_loss
+            reward_1 = target_1 - entry_price
+            reward_2 = target_2 - entry_price
+        else:
+            risk_amount = stop_loss - entry_price
+            reward_1 = entry_price - target_1
+            reward_2 = entry_price - target_2
+
+        rr_ratio_1 = reward_1 / risk_amount if risk_amount > 0 else 0
+        rr_ratio_2 = reward_2 / risk_amount if risk_amount > 0 else 0
+
+        # Calculate percentage moves
+        stop_loss_pct = ((stop_loss - entry_price) / entry_price) * 100
+        target_1_pct = ((target_1 - entry_price) / entry_price) * 100
+        target_2_pct = ((target_2 - entry_price) / entry_price) * 100
+
+        # Determine Timeframe based on volatility and confidence
+        daily_volatility = (atr / close) * 100  # ATR as % of price
+
+        if daily_volatility > 3:
+            # High volatility - shorter timeframe
+            if confidence >= 70:
+                timeframe = "1-3 days (Intraday/Swing)"
+            else:
+                timeframe = "1-2 days (Intraday)"
+        elif daily_volatility > 1.5:
+            # Medium volatility
+            if confidence >= 70:
+                timeframe = "1-2 weeks (Swing Trade)"
+            else:
+                timeframe = "3-5 days (Short Swing)"
+        else:
+            # Low volatility - longer timeframe
+            if confidence >= 70:
+                timeframe = "2-4 weeks (Positional)"
+            else:
+                timeframe = "1-2 weeks (Swing Trade)"
+
+        # Determine trade quality
+        if confidence >= 75 and rr_ratio_1 >= 1.5:
+            trade_quality = "HIGH QUALITY SETUP"
+        elif confidence >= 60 and rr_ratio_1 >= 1.2:
+            trade_quality = "GOOD SETUP"
+        elif confidence >= 50:
+            trade_quality = "MODERATE SETUP"
+        else:
+            trade_quality = "WEAK SETUP - CAUTION"
+
+        return {
+            "action": action,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "stop_loss_pct": stop_loss_pct,
+            "target_1": target_1,
+            "target_1_pct": target_1_pct,
+            "target_2": target_2,
+            "target_2_pct": target_2_pct,
+            "rr_ratio_1": rr_ratio_1,
+            "rr_ratio_2": rr_ratio_2,
+            "timeframe": timeframe,
+            "trade_quality": trade_quality,
+            "atr": atr,
+            "daily_volatility": daily_volatility,
+            "support": min(support_1, support_2),
+            "resistance": max(resistance_1, resistance_2),
+            "risk_amount": risk_amount,
+            "methodology": {
+                "stop_loss_method": "ATR (1.5x) + Swing Low/High",
+                "target_method": "Risk:Reward Ratio (1:1.5 and 1:2.5)",
+                "timeframe_method": "Based on ATR volatility + Confidence score",
+                "data_used": "3 months historical OHLCV data",
+                "indicators_used": "RSI(14), MACD(12,26,9), SMA(20,50), Bollinger Bands(20,2), ATR(14), Volume"
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Trading levels calculation error: {e}")
         return None
 
 # ===== ENHANCED CHART GENERATION =====
@@ -657,46 +1235,63 @@ def handle_start(chat_id, user_name):
 
 Hello {user_name}! I'm your AI-powered stock analysis assistant.
 
-*Available Commands:*
-
-/stock SYMBOL - Detailed analysis with confidence score
-  Example: /stock RELIANCE or /stock TCS
+*📈 STOCK ANALYSIS:*
+/stock SYMBOL - *Complete Trading Analysis*
+  • Current Price & Change
+  • Target 1, Target 2, Stop Loss
+  • Timeframe & Hold Duration
+  • Risk:Reward Ratio
+  • Confidence Score (0-100)
+  Example: /stock RELIANCE
 
 /price SYMBOL - Quick price check
+/chart SYMBOL - Technical chart with indicators
 
-/chart SYMBOL - Enhanced technical chart
-  (Price, Volume, RSI, MACD, Bollinger Bands)
+*📊 INDEX TRADING:*
+/nifty - NIFTY 50 signal with levels
+/banknifty - Bank NIFTY signal
+/sensex - SENSEX signal
+/giftnifty - Gift Nifty status (SGX)
 
-/summary - Get NIFTY, SENSEX & BANKNIFTY
+*🎯 SIGNAL TRACKING:*
+/signals - View all active signals
+/history - Trade history & win rate
+/mistakes - Track failed signals for learning
 
+*📰 MARKET INFO:*
+/summary - NIFTY, SENSEX, BANKNIFTY
 /news - Latest market news
 
+*📋 PORTFOLIO:*
 /watchlist - View your watchlist
-/watchlist add SYMBOL - Add stock
-/watchlist remove SYMBOL - Remove stock
-
-/portfolio - View your holdings
+/watchlist add/remove SYMBOL
+/portfolio - View holdings
 /portfolio add SYMBOL QTY PRICE
-
 /alert SYMBOL PRICE - Set price alert
 /alerts - View your alerts
 
-/help - Show this help message
+*🤖 AUTOMATIC FEATURES:*
+  ✅ Target Hit Notifications (real-time)
+  ✅ Stop Loss Alerts
+  ✅ Signal Expiry Alerts
+  ✅ Index Signals (NIFTY/BANKNIFTY)
+  ✅ Gift Nifty Close (7PM & 11:30PM)
+  ✅ Market Open/Close Alerts
+  ✅ High Confidence Opportunities
+  ✅ Breaking News Alerts
+  ✅ Weekly Report (Saturday 6PM)
+  ✅ Mistake Tracking for Learning
 
-*New Features:*
-  Advanced Confidence Score (0-100)
-  6-Factor Analysis (RSI, MACD, SMA, BB, Volume, Momentum)
-  High-Confidence Alerts (score >= 70)
-  Enhanced Multi-Panel Charts
+*Signal Format Includes:*
+  • Current Price
+  • Target 1 & Target 2
+  • Stop Loss
+  • Timeframe (5min/15min/1day etc.)
+  • How Long to Hold
+  • Risk:Reward Ratio
+  • Confidence Score
 
-*Automatic Alerts:*
-  Market Open/Close (9:15 AM / 3:30 PM)
-  Morning & Afternoon Updates (10:30 AM / 1:30 PM)
-  High Confidence Opportunities (every 15 min)
-  Breaking News Alerts (every 10 min)
-  Weekly Report (Saturday 6 PM)
-
-Start with `/stock RELIANCE` to see the analysis!"""
+Start with `/stock RELIANCE` or `/nifty` to see it in action!"""
     send_message(chat_id, msg)
 
 def handle_price(chat_id, symbol):
@@ -779,10 +1374,120 @@ def handle_stock(chat_id, symbol):
   • 52W Low: ₹{info.get('52w_low', 0):,.2f}
   • P/E: {info.get('pe_ratio', 0):.2f}
   • Sector: {info.get('sector', 'N/A')}
+"""
 
-_Not financial advice_"""
+    # Calculate trading levels if signal is not NEUTRAL
+    analysis_df = analysis.get('df', df)
+    trading = calculate_trading_levels(analysis_df, analysis, info)
 
+    if trading:
+        action_emoji = "🟢" if trading['action'] == "BUY" else "🔴"
+        msg += f"""
+{'='*30}
+*TRADING RECOMMENDATION*
+{'='*30}
+
+{action_emoji} *Action:* {trading['action']}
+*Quality:* {trading['trade_quality']}
+*Timeframe:* {trading['timeframe']}
+
+*Entry Price:* ₹{trading['entry_price']:,.2f}
+
+🎯 *Target 1:* ₹{trading['target_1']:,.2f} ({trading['target_1_pct']:+.2f}%)
+   R:R Ratio = 1:{trading['rr_ratio_1']:.1f}
+
+🎯 *Target 2:* ₹{trading['target_2']:,.2f} ({trading['target_2_pct']:+.2f}%)
+   R:R Ratio = 1:{trading['rr_ratio_2']:.1f}
+
+🛑 *Stop Loss:* ₹{trading['stop_loss']:,.2f} ({trading['stop_loss_pct']:+.2f}%)
+   Risk: ₹{trading['risk_amount']:,.2f} per share
+
+*Key Levels:*
+  • Support: ₹{trading['support']:,.2f}
+  • Resistance: ₹{trading['resistance']:,.2f}
+
+*Volatility:* {trading['daily_volatility']:.2f}% (ATR: ₹{trading['atr']:,.2f})
+"""
+    else:
+        msg += f"""
+{'='*30}
+*TRADING RECOMMENDATION*
+{'='*30}
+
+⚠️ *No Clear Trade Setup*
+
+Signal is NEUTRAL - Wait for clearer direction.
+"""
+
+    msg += "\n_Not financial advice. Do your own research._"
     send_message(chat_id, msg)
+
+    # Create active signal for target tracking (if non-NEUTRAL signal)
+    if trading and analysis['signal'] != 'NEUTRAL':
+        signal_id = create_active_signal(
+            symbol=symbol.upper(),
+            signal_type=trading['action'],
+            entry_price=trading['entry_price'],
+            target_1=trading['target_1'],
+            target_2=trading['target_2'],
+            stop_loss=trading['stop_loss'],
+            timeframe=trading['timeframe'],
+            confidence=conf_score,
+            methodology=trading.get('methodology', {})
+        )
+
+        # Send tracking confirmation
+        tracking_msg = f"""📍 *SIGNAL TRACKING ACTIVATED*
+
+Signal ID: `{signal_id}`
+
+I will monitor this signal and notify you when:
+  ✅ Target 1 is hit
+  ✅ Target 2 is hit
+  🛑 Stop Loss is hit
+  ⏰ Signal expires (based on timeframe)
+
+Use `/signals` to view all active signals.
+Use `/history` to view trade history."""
+        send_message(chat_id, tracking_msg)
+
+    # Send methodology in a separate message for clarity
+    if trading:
+        method_msg = f"""📊 *HOW THIS WAS CALCULATED*
+
+*Data Used:*
+  • 3 months historical price data (OHLCV)
+  • Real-time price from Yahoo Finance
+
+*Indicators Analyzed:*
+  • RSI (14-period) - Momentum
+  • MACD (12,26,9) - Trend
+  • SMA (20 & 50) - Moving Averages
+  • Bollinger Bands (20,2) - Volatility
+  • ATR (14-period) - Average True Range
+  • Volume Analysis - Buying/Selling pressure
+  • 5-day Momentum - Price direction
+
+*Stop Loss Calculation:*
+  {trading['methodology']['stop_loss_method']}
+
+*Target Calculation:*
+  {trading['methodology']['target_method']}
+
+*Timeframe Selection:*
+  {trading['methodology']['timeframe_method']}
+
+*Confidence Score (0-100):*
+  Sum of 6 factors:
+  - RSI: ±20 points
+  - MACD: ±20 points
+  - SMA Trend: ±15 points
+  - Bollinger: ±15 points
+  - Volume: ±15 points
+  - Momentum: ±15 points
+
+_Higher score = Stronger signal_"""
+        send_message(chat_id, method_msg)
 
 def handle_chart(chat_id, symbol):
     send_message(chat_id, f"Generating chart for {symbol}...")
@@ -907,6 +1612,220 @@ def handle_portfolio(chat_id, action=None, symbol=None, qty=None, price=None):
         total_pnl = total_cur - total_inv
         msg += f"*Total P/L:* Rs {total_pnl:+,.2f}"
         send_message(chat_id, msg)
+
+
+def handle_signals(chat_id):
+    """Show all active signals being tracked."""
+    global active_signals
+
+    if not active_signals:
+        send_message(chat_id, """📊 *NO ACTIVE SIGNALS*
+
+You don't have any active signals being tracked.
+
+Use `/stock SYMBOL` to analyze a stock and create a signal.
+
+Example: `/stock RELIANCE`""")
+        return
+
+    now = datetime.now(IST)
+    msg = f"""📊 *ACTIVE SIGNALS*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+"""
+
+    for signal_id, signal in active_signals.items():
+        # Get current price
+        try:
+            if signal["symbol"] in INDEX_WATCHLIST:
+                data = get_index_data(signal["symbol"])
+                current_price = data.get("value", 0) if data else 0
+            else:
+                info = get_stock_info(signal["symbol"])
+                current_price = info.get("price", 0) if info else 0
+        except:
+            current_price = signal["entry_price"]
+
+        # Calculate P&L
+        if signal["type"] == "BUY":
+            pnl_pct = ((current_price - signal["entry_price"]) / signal["entry_price"]) * 100
+        else:
+            pnl_pct = ((signal["entry_price"] - current_price) / signal["entry_price"]) * 100
+
+        status_emoji = "🟢" if signal["status"] == "ACTIVE" else "🎯" if "TARGET" in signal["status"] else "🔴"
+        type_emoji = "📈" if signal["type"] == "BUY" else "📉"
+
+        # Time remaining
+        time_remaining = signal["expiry_at"] - now
+        hours_left = time_remaining.total_seconds() / 3600
+
+        msg += f"""{status_emoji} *{signal['symbol']}* - {signal['type']} {type_emoji}
+  Status: {signal['status']}
+  Entry: ₹{signal['entry_price']:,.2f}
+  Current: ₹{current_price:,.2f} ({pnl_pct:+.2f}%)
+  Target 1: ₹{signal['target_1']:,.2f} {'✅' if signal.get('target_1_hit_at') else '⏳'}
+  Target 2: ₹{signal['target_2']:,.2f} {'✅' if signal.get('target_2_hit_at') else '⏳'}
+  Stop Loss: ₹{signal['stop_loss']:,.2f}
+  Timeframe: {signal['timeframe']}
+  Expires in: {hours_left:.1f} hours
+
+"""
+
+    msg += f"_Total Active Signals: {len(active_signals)}_"
+    send_message(chat_id, msg)
+
+
+def handle_history(chat_id):
+    """Show trade history."""
+    global trade_history
+
+    if not trade_history:
+        send_message(chat_id, """📜 *NO TRADE HISTORY*
+
+You don't have any completed trades yet.
+
+As signals hit targets or expire, they'll appear here.""")
+        return
+
+    now = datetime.now(IST)
+    msg = f"""📜 *TRADE HISTORY*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+"""
+
+    # Show last 10 trades
+    recent_trades = trade_history[-10:]
+
+    wins = 0
+    losses = 0
+
+    for trade in reversed(recent_trades):
+        result = trade.get("status", "UNKNOWN")
+
+        if "TARGET" in result:
+            result_emoji = "✅"
+            wins += 1
+        elif "STOP_LOSS" in result:
+            result_emoji = "❌"
+            losses += 1
+        elif "EXPIRED" in result:
+            result_emoji = "⏰"
+            losses += 1
+        else:
+            result_emoji = "❔"
+
+        msg += f"""{result_emoji} *{trade['symbol']}* - {trade['type']}
+  Result: {result}
+  Entry: ₹{trade['entry_price']:,.2f}
+  Confidence: {trade['confidence']}/100
+
+"""
+
+    # Win rate
+    total = wins + losses
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    msg += f"""{'='*30}
+*STATISTICS:*
+  ✅ Wins: {wins}
+  ❌ Losses: {losses}
+  📊 Win Rate: {win_rate:.1f}%
+
+_Showing last {len(recent_trades)} trades_"""
+
+    send_message(chat_id, msg)
+
+
+def handle_mistakes(chat_id):
+    """Show tracked mistakes for learning."""
+    global market_mistakes
+
+    if not market_mistakes:
+        send_message(chat_id, """📝 *NO MISTAKES TRACKED*
+
+Great! No failed trades recorded yet.
+
+When signals hit stop loss or expire without target, they'll be recorded here for learning.""")
+        return
+
+    now = datetime.now(IST)
+    msg = f"""📝 *MISTAKE TRACKER - LEARNING*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*Recent Failed Signals:*
+
+"""
+
+    # Show last 5 mistakes
+    recent_mistakes = market_mistakes[-5:]
+
+    for i, mistake in enumerate(reversed(recent_mistakes), 1):
+        msg += f"""*{i}. {mistake['symbol']}* ({mistake['date']})
+  Signal: {mistake['signal_type']}
+  Confidence: {mistake['confidence']}/100
+  Issue: {mistake['what_went_wrong'][:50]}...
+  Lesson: {mistake['lesson'][:50]}...
+
+"""
+
+    # Analysis
+    if len(market_mistakes) >= 3:
+        avg_conf = sum(m['confidence'] for m in market_mistakes) / len(market_mistakes)
+        msg += f"""{'='*30}
+*PATTERN ANALYSIS:*
+  • Total Mistakes: {len(market_mistakes)}
+  • Avg Failed Confidence: {avg_conf:.1f}/100
+
+*Recommendation:*"""
+        if avg_conf > 60:
+            msg += "\n  ⚠️ High confidence signals failing. Review methodology."
+        else:
+            msg += "\n  ℹ️ Low confidence signals failing as expected. Consider stricter filters."
+
+    msg += "\n\n_Use this data to improve future analysis._"
+    send_message(chat_id, msg)
+
+
+def handle_giftnifty(chat_id):
+    """Show current Gift Nifty status."""
+    gift_data = get_gift_nifty_data()
+
+    if not gift_data:
+        send_message(chat_id, "Unable to fetch Gift Nifty data. Try again later.")
+        return
+
+    now = datetime.now(IST)
+    emoji = "📈" if gift_data['change'] >= 0 else "📉"
+
+    msg = f"""🌐 *GIFT NIFTY STATUS*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+{emoji} *GIFT NIFTY*
+
+📊 *Current:* {gift_data['current']:,.2f}
+📊 *Open:* {gift_data['open']:,.2f}
+📊 *Change:* {gift_data['change']:+,.2f} ({gift_data['pct']:+.2f}%)
+
+*Today's Range:*
+  🔺 High: {gift_data['high']:,.2f}
+  🔻 Low: {gift_data['low']:,.2f}
+  📏 Range: {gift_data['range']:,.2f} points
+
+*Market Indication:*
+"""
+    if gift_data['pct'] > 0.5:
+        msg += "  ✅ Bullish sentiment - Gap up expected"
+    elif gift_data['pct'] < -0.5:
+        msg += "  ⚠️ Bearish sentiment - Gap down expected"
+    else:
+        msg += "  ➡️ Flat to neutral opening expected"
+
+    msg += """
+
+_Gift Nifty trades on SGX from 6:30 AM to 11:30 PM IST_"""
+
+    send_message(chat_id, msg)
+
 
 # ===== AUTOMATIC ALERTS =====
 
@@ -1048,12 +1967,183 @@ _Source: {article.get('source', {}).get('name', 'Unknown')}_"""
         logger.error(f"Breaking news check error: {e}")
 
 
+def send_gift_nifty_close_notification():
+    """
+    Send Gift Nifty close summary notification.
+    Gift Nifty closes at 11:30 PM IST.
+    """
+    try:
+        gift_data = get_gift_nifty_data()
+
+        if not gift_data:
+            logger.warning("Could not fetch Gift Nifty data")
+            return
+
+        now = datetime.now(IST)
+        emoji = "📈" if gift_data['change'] >= 0 else "📉"
+
+        msg = f"""🌙 *GIFT NIFTY CLOSE UPDATE*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+{emoji} *GIFT NIFTY*
+
+📊 *Current:* {gift_data['current']:,.2f}
+📊 *Change:* {gift_data['change']:+,.2f} ({gift_data['pct']:+.2f}%)
+
+*Today's Range:*
+  🔺 High: {gift_data['high']:,.2f}
+  🔻 Low: {gift_data['low']:,.2f}
+  📏 Range: {gift_data['range']:,.2f} points
+
+*Opening Data:*
+  📍 Open: {gift_data['open']:,.2f}
+
+*What This Means:*
+"""
+        if gift_data['pct'] > 0.5:
+            msg += "  ✅ Positive cues for Indian markets tomorrow\n"
+            msg += "  📈 Gap-up opening expected\n"
+        elif gift_data['pct'] < -0.5:
+            msg += "  ⚠️ Negative cues for Indian markets tomorrow\n"
+            msg += "  📉 Gap-down opening expected\n"
+        else:
+            msg += "  ➡️ Flat to slightly positive/negative opening expected\n"
+            msg += "  📊 Watch global cues and US markets\n"
+
+        msg += """
+_Gift Nifty indicates SGX Nifty futures movement._
+_Use this for tomorrow's market sentiment._"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info("Gift Nifty close notification sent")
+
+    except Exception as e:
+        logger.error(f"Gift Nifty notification error: {e}")
+
+
+def check_index_signals():
+    """
+    Check NIFTY, BANKNIFTY, SENSEX for trading opportunities.
+    Generate signals when high confidence setup is detected.
+    """
+    global last_scheduled_alert
+
+    try:
+        now = datetime.now(IST)
+        today_key = now.strftime('%Y-%m-%d-%H')
+        index_alerts = []
+
+        for idx in INDEX_WATCHLIST:
+            # Check if we already sent alert for this index this hour
+            alert_key = f"index_{idx}_{today_key}"
+            if last_scheduled_alert.get(alert_key):
+                continue
+
+            df = get_stock_data(idx, period="3mo")
+            if df is None:
+                continue
+
+            analysis = analyze_stock(df)
+            if not analysis:
+                continue
+
+            confidence = analysis.get('confidence_score', 50)
+            signal = analysis.get('signal', 'NEUTRAL')
+
+            # Only alert for high confidence signals (>=65 for indices)
+            if confidence >= 65 and signal != 'NEUTRAL':
+                data = get_index_data(idx)
+                current_price = data.get('value', 0) if data else 0
+
+                # Calculate trading levels
+                trading = calculate_trading_levels(analysis.get('df', df), analysis, {"price": current_price})
+
+                if trading:
+                    index_alerts.append({
+                        'symbol': idx,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'price': current_price,
+                        'change_pct': data.get('pct', 0) if data else 0,
+                        'trading': trading,
+                        'score_factors': analysis.get('score_factors', {}),
+                        'rsi': analysis.get('rsi', 50)
+                    })
+                    last_scheduled_alert[alert_key] = True
+
+        if index_alerts:
+            for alert in index_alerts:
+                trading = alert['trading']
+                emoji = "🟢" if "BUY" in alert['signal'] else "🔴"
+                conf_emoji = "🟢🟢🟢" if alert['confidence'] >= 75 else "🟢🟢"
+
+                msg = f"""📊 *INDEX SIGNAL ALERT* {emoji}
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*{alert['symbol']}* - {alert['signal']}
+*Confidence: {alert['confidence']}/100* {conf_emoji}
+
+📈 *Current Price:* {alert['price']:,.2f}
+📊 *Today's Change:* {alert['change_pct']:+.2f}%
+
+{'='*30}
+*TRADING RECOMMENDATION*
+{'='*30}
+
+{emoji} *Action:* {trading['action']}
+*Quality:* {trading['trade_quality']}
+*Timeframe:* {trading['timeframe']}
+
+*Entry Price:* {trading['entry_price']:,.2f}
+
+🎯 *Target 1:* {trading['target_1']:,.2f} ({trading['target_1_pct']:+.2f}%)
+   R:R = 1:{trading['rr_ratio_1']:.1f}
+
+🎯 *Target 2:* {trading['target_2']:,.2f} ({trading['target_2_pct']:+.2f}%)
+   R:R = 1:{trading['rr_ratio_2']:.1f}
+
+🛑 *Stop Loss:* {trading['stop_loss']:,.2f} ({trading['stop_loss_pct']:+.2f}%)
+
+*Key Levels:*
+  • Support: {trading['support']:,.2f}
+  • Resistance: {trading['resistance']:,.2f}
+
+*Score Breakdown:*
+"""
+                for factor, detail in list(alert['score_factors'].items())[:4]:
+                    msg += f"  • {factor}: {detail}\n"
+
+                msg += """
+_For F&O trading. This is not financial advice._"""
+
+                send_message(ADMIN_CHAT_ID, msg)
+
+                # Create active signal for tracking
+                create_active_signal(
+                    symbol=alert['symbol'],
+                    signal_type=trading['action'],
+                    entry_price=trading['entry_price'],
+                    target_1=trading['target_1'],
+                    target_2=trading['target_2'],
+                    stop_loss=trading['stop_loss'],
+                    timeframe=trading['timeframe'],
+                    confidence=alert['confidence'],
+                    methodology=trading.get('methodology', {})
+                )
+
+            logger.info(f"Index signals sent: {len(index_alerts)} indices")
+
+    except Exception as e:
+        logger.error(f"Index signals check error: {e}")
+
+
 def check_strong_signals():
     """Check watchlist for strong buy/sell signals based on confidence score"""
     try:
         strong_alerts = []
 
-        for sym in DEFAULT_WATCHLIST:
+        # Check both stocks AND indices
+        for sym in FULL_WATCHLIST:
             df = get_stock_data(sym, period="1mo")
             if df is None:
                 continue
@@ -1371,6 +2461,30 @@ def run_scheduler():
             if current_minute % 15 == 0 and 9 <= current_hour < 16:
                 check_high_confidence_alerts()
 
+            # ===== INDEX SIGNALS =====
+            # Check NIFTY, BANKNIFTY, SENSEX for signals every hour during market hours
+            if current_minute == 0 and 9 <= current_hour < 16:
+                check_index_signals()
+
+            # ===== TARGET HIT MONITORING =====
+            # Check active signals for target hits every 5 minutes during market hours
+            if current_minute % 5 == 0 and 9 <= current_hour < 16:
+                check_signal_targets()
+
+            # ===== GIFT NIFTY CLOSE NOTIFICATION =====
+            # Send Gift Nifty update at 11:30 PM IST
+            if current_hour == 23 and current_minute == 30:
+                if last_scheduled_alert.get('gift_nifty') != today_key:
+                    send_gift_nifty_close_notification()
+                    last_scheduled_alert['gift_nifty'] = today_key
+
+            # ===== EVENING GIFT NIFTY UPDATE =====
+            # Send Gift Nifty status at 7 PM IST (before US market opens)
+            if current_hour == 19 and current_minute == 0:
+                if last_scheduled_alert.get('gift_nifty_evening') != today_key:
+                    send_gift_nifty_close_notification()
+                    last_scheduled_alert['gift_nifty_evening'] = today_key
+
             time.sleep(60)  # Check every minute
 
         except Exception as e:
@@ -1462,6 +2576,20 @@ def run_bot():
                                 handle_portfolio(chat_id, 'remove', parts[2])
                             else:
                                 handle_portfolio(chat_id)
+                        elif cmd == '/signals':
+                            handle_signals(chat_id)
+                        elif cmd == '/history':
+                            handle_history(chat_id)
+                        elif cmd == '/mistakes':
+                            handle_mistakes(chat_id)
+                        elif cmd == '/giftnifty':
+                            handle_giftnifty(chat_id)
+                        elif cmd == '/nifty':
+                            handle_stock(chat_id, 'NIFTY')
+                        elif cmd == '/banknifty':
+                            handle_stock(chat_id, 'BANKNIFTY')
+                        elif cmd == '/sensex':
+                            handle_stock(chat_id, 'SENSEX')
                         else:
                             send_message(chat_id, "Unknown command. Use /help")
 

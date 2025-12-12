@@ -66,11 +66,42 @@ INDIAN_INDICES = {
 # Index watchlist for signal generation
 INDEX_WATCHLIST = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
-# Default Watchlist (stocks)
-DEFAULT_WATCHLIST = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"]
+# Default Watchlist (stocks) - Comprehensive list for monitoring
+DEFAULT_WATCHLIST = [
+    # Large Cap - Banking
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
+    "INDUSINDBK", "KOTAKBANK",
+    # IT Sector
+    "INFY", "TCS", "HCLTECH", "TECHM",
+    # Metal & Mining
+    "TATASTEEL", "HINDALCO", "COALINDIA",
+    # Energy & Power
+    "ONGC", "NTPC", "TATAPOWER", "RELPOWER",
+    # Infrastructure
+    "LT", "ULTRACEMCO", "BHEL",
+    # Auto
+    "TATAMOTORS", "MARUTI",
+    # Telecom
+    "BHARTIARTL", "IDEA",
+    # Adani Group
+    "ADANIENT", "ADANIPORTS",
+    # High Volatility / Momentum
+    "YESBANK", "SUZLON",
+]
 
 # Combined watchlist for signal monitoring
 FULL_WATCHLIST = DEFAULT_WATCHLIST + INDEX_WATCHLIST
+
+# Global Market Indices for morning summary
+GLOBAL_INDICES = {
+    "DOW": "^DJI",       # Dow Jones
+    "NASDAQ": "^IXIC",   # Nasdaq
+    "S&P500": "^GSPC",   # S&P 500
+    "NIKKEI": "^N225",   # Japan
+    "HANGSENG": "^HSI",  # Hong Kong
+    "FTSE": "^FTSE",     # UK
+    "SGX": "ES=F",       # SGX Futures (proxy for Gift Nifty)
+}
 
 # User Data Storage
 user_data = {}
@@ -3146,6 +3177,830 @@ Found {len(high_conf_alerts)} stock(s) with confidence score >= 70!
         logger.error(f"High confidence check error: {e}")
 
 
+# ===== NEW AUTOMATIC FEATURES =====
+
+def send_intraday_picks():
+    """
+    Send 3-5 best intraday trading picks at 9:15 AM.
+    Based on pre-market analysis, gap analysis, and technical setup.
+    """
+    try:
+        now = datetime.now(IST)
+        intraday_picks = []
+
+        for sym in DEFAULT_WATCHLIST:
+            try:
+                df = get_stock_data(sym, period="1mo")
+                if df is None or len(df) < 20:
+                    continue
+
+                analysis = analyze_stock(df)
+                if not analysis:
+                    continue
+
+                info = get_stock_info(sym)
+                if not info:
+                    continue
+
+                price = info.get('price', 0)
+                prev_close = info.get('previous_close', price)
+                gap_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+
+                rsi = analysis.get('rsi', 50)
+                confidence = analysis.get('confidence_score', 50)
+                signal = analysis.get('signal', 'NEUTRAL')
+
+                # Calculate intraday score
+                intraday_score = 0
+
+                # Gap analysis (+/- 20 points)
+                if 0.5 < gap_pct < 2:  # Moderate gap up = bullish
+                    intraday_score += 15
+                elif -2 < gap_pct < -0.5:  # Moderate gap down = bearish reversal potential
+                    intraday_score += 10
+
+                # RSI for intraday
+                if 30 < rsi < 40:  # Oversold bounce
+                    intraday_score += 20
+                elif 60 < rsi < 70:  # Momentum play
+                    intraday_score += 15
+
+                # Volume check (from previous day)
+                if len(df) >= 2:
+                    avg_vol = df['volume'].tail(20).mean()
+                    last_vol = df['volume'].iloc[-1]
+                    if last_vol > avg_vol * 1.5:
+                        intraday_score += 15
+
+                # Confidence boost
+                if confidence >= 60:
+                    intraday_score += 15
+                elif confidence >= 50:
+                    intraday_score += 5
+
+                if intraday_score >= 25 and signal != 'NEUTRAL':
+                    # Calculate intraday levels
+                    high = info.get('high', price * 1.01)
+                    low = info.get('low', price * 0.99)
+                    pivot = (high + low + prev_close) / 3
+                    r1 = 2 * pivot - low
+                    s1 = 2 * pivot - high
+
+                    intraday_picks.append({
+                        'symbol': sym,
+                        'price': price,
+                        'gap_pct': gap_pct,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'rsi': rsi,
+                        'intraday_score': intraday_score,
+                        'pivot': pivot,
+                        'r1': r1,
+                        's1': s1,
+                        'target': r1 if 'BUY' in signal else s1,
+                        'stop_loss': s1 if 'BUY' in signal else r1,
+                    })
+
+            except Exception as e:
+                logger.error(f"Intraday analysis error for {sym}: {e}")
+                continue
+
+        if not intraday_picks:
+            logger.info("No strong intraday picks today")
+            return
+
+        # Sort by intraday score
+        intraday_picks.sort(key=lambda x: x['intraday_score'], reverse=True)
+        top_picks = intraday_picks[:5]
+
+        msg = f"""🌅 *INTRADAY PICKS - {now.strftime('%Y-%m-%d')}*
+_Market Opening at 9:15 AM IST_
+
+Top {len(top_picks)} stocks for today's intraday trading:
+
+"""
+
+        for i, pick in enumerate(top_picks, 1):
+            emoji = "🟢" if "BUY" in pick['signal'] else "🔴"
+            gap_emoji = "📈" if pick['gap_pct'] > 0 else "📉"
+
+            msg += f"""*{i}. {pick['symbol']}* {emoji}
+  💰 CMP: ₹{pick['price']:,.2f} {gap_emoji} Gap: {pick['gap_pct']:+.2f}%
+  📊 Signal: {pick['signal']} (Score: {pick['intraday_score']})
+  🎯 Target: ₹{pick['target']:,.2f}
+  🛑 Stop Loss: ₹{pick['stop_loss']:,.2f}
+  📍 Pivot: ₹{pick['pivot']:,.2f}
+
+"""
+
+        msg += """*Trading Rules:*
+• Enter after 9:30 AM (avoid first 15 min volatility)
+• Book 50% at Target 1, trail rest
+• Exit all positions by 3:15 PM
+• Max 2-3% risk per trade
+
+_Not financial advice. Trade responsibly._"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info(f"Intraday picks sent: {len(top_picks)} stocks")
+
+    except Exception as e:
+        logger.error(f"Intraday picks error: {e}")
+
+
+def send_swing_trade_ideas():
+    """
+    Send weekly swing trade suggestions every Sunday at 7 PM.
+    Based on weekly charts, trend analysis, and breakout setups.
+    """
+    try:
+        now = datetime.now(IST)
+        swing_picks = []
+
+        for sym in DEFAULT_WATCHLIST:
+            try:
+                # Get 3 months data for swing analysis
+                df = get_stock_data(sym, period="3mo")
+                if df is None or len(df) < 50:
+                    continue
+
+                analysis = analyze_stock(df)
+                if not analysis:
+                    continue
+
+                info = get_stock_info(sym)
+                if not info:
+                    continue
+
+                price = info.get('price', 0)
+                confidence = analysis.get('confidence_score', 50)
+                signal = analysis.get('signal', 'NEUTRAL')
+                rsi = analysis.get('rsi', 50)
+
+                # Calculate swing score
+                swing_score = 0
+
+                # Trend analysis
+                if len(df) >= 50:
+                    sma20 = df['close'].tail(20).mean()
+                    sma50 = df['close'].tail(50).mean()
+
+                    if price > sma20 > sma50:  # Uptrend
+                        swing_score += 20
+                    elif price < sma20 < sma50:  # Downtrend
+                        swing_score -= 10
+
+                # RSI for swing
+                if 40 < rsi < 60:  # Neutral RSI = room to move
+                    swing_score += 10
+                elif rsi < 35:  # Oversold
+                    swing_score += 15
+
+                # Confidence
+                if confidence >= 65:
+                    swing_score += 20
+                elif confidence >= 55:
+                    swing_score += 10
+
+                # Weekly momentum
+                if len(df) >= 5:
+                    week_return = ((price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100)
+                    if 1 < week_return < 5:  # Moderate momentum
+                        swing_score += 10
+
+                if swing_score >= 30 and signal != 'NEUTRAL':
+                    # Calculate swing levels (wider targets)
+                    atr = df['close'].diff().abs().tail(14).mean()
+                    if 'BUY' in signal:
+                        target_1 = price + (atr * 2)
+                        target_2 = price + (atr * 4)
+                        stop_loss = price - (atr * 1.5)
+                    else:
+                        target_1 = price - (atr * 2)
+                        target_2 = price - (atr * 4)
+                        stop_loss = price + (atr * 1.5)
+
+                    swing_picks.append({
+                        'symbol': sym,
+                        'price': price,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'rsi': rsi,
+                        'swing_score': swing_score,
+                        'target_1': target_1,
+                        'target_2': target_2,
+                        'stop_loss': stop_loss,
+                        'holding_period': '5-10 days',
+                    })
+
+            except Exception as e:
+                continue
+
+        if not swing_picks:
+            logger.info("No swing trade ideas this week")
+            return
+
+        # Sort by swing score
+        swing_picks.sort(key=lambda x: x['swing_score'], reverse=True)
+        top_picks = swing_picks[:5]
+
+        msg = f"""📈 *WEEKLY SWING TRADE IDEAS*
+_{now.strftime('%A, %B %d, %Y')}_
+
+Top {len(top_picks)} swing trade setups for this week:
+
+"""
+
+        for i, pick in enumerate(top_picks, 1):
+            emoji = "🟢" if "BUY" in pick['signal'] else "🔴"
+
+            msg += f"""*{i}. {pick['symbol']}* {emoji}
+  💰 Entry: ₹{pick['price']:,.2f}
+  📊 Signal: {pick['signal']} (Score: {pick['swing_score']})
+  🎯 Target 1: ₹{pick['target_1']:,.2f}
+  🎯 Target 2: ₹{pick['target_2']:,.2f}
+  🛑 Stop Loss: ₹{pick['stop_loss']:,.2f}
+  ⏱️ Holding: {pick['holding_period']}
+  RSI: {pick['rsi']:.1f}
+
+"""
+
+        msg += """*Swing Trading Rules:*
+• Enter on dips/pullbacks
+• Keep strict stop loss
+• Book partial at Target 1
+• Hold winners, cut losers quickly
+
+_Not financial advice. DYOR._"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info(f"Swing trade ideas sent: {len(top_picks)} stocks")
+
+    except Exception as e:
+        logger.error(f"Swing trade ideas error: {e}")
+
+
+def check_golden_death_cross():
+    """
+    Check for Golden Cross (SMA50 crosses above SMA200) or
+    Death Cross (SMA50 crosses below SMA200) signals.
+    """
+    global last_scheduled_alert
+
+    try:
+        now = datetime.now(IST)
+        today_key = now.strftime('%Y-%m-%d')
+        cross_alerts = []
+
+        for sym in DEFAULT_WATCHLIST + INDEX_WATCHLIST:
+            try:
+                alert_key = f"cross_{sym}_{today_key}"
+                if last_scheduled_alert.get(alert_key):
+                    continue
+
+                df = get_stock_data(sym, period="1y")
+                if df is None or len(df) < 200:
+                    continue
+
+                # Calculate SMAs
+                sma50 = df['close'].rolling(50).mean()
+                sma200 = df['close'].rolling(200).mean()
+
+                if len(sma50) < 2 or len(sma200) < 2:
+                    continue
+
+                # Check for crossover (today vs yesterday)
+                today_50 = sma50.iloc[-1]
+                today_200 = sma200.iloc[-1]
+                yest_50 = sma50.iloc[-2]
+                yest_200 = sma200.iloc[-2]
+
+                cross_type = None
+
+                # Golden Cross: SMA50 crosses ABOVE SMA200
+                if yest_50 <= yest_200 and today_50 > today_200:
+                    cross_type = "GOLDEN CROSS"
+
+                # Death Cross: SMA50 crosses BELOW SMA200
+                elif yest_50 >= yest_200 and today_50 < today_200:
+                    cross_type = "DEATH CROSS"
+
+                if cross_type:
+                    info = get_stock_info(sym)
+                    price = info.get('price', df['close'].iloc[-1]) if info else df['close'].iloc[-1]
+
+                    cross_alerts.append({
+                        'symbol': sym,
+                        'cross_type': cross_type,
+                        'price': price,
+                        'sma50': today_50,
+                        'sma200': today_200,
+                    })
+                    last_scheduled_alert[alert_key] = True
+
+            except Exception as e:
+                continue
+
+        for alert in cross_alerts:
+            if alert['cross_type'] == "GOLDEN CROSS":
+                emoji = "🟢✨"
+                meaning = "BULLISH - Long term uptrend beginning"
+                action = "Consider accumulating on dips"
+            else:
+                emoji = "🔴💀"
+                meaning = "BEARISH - Long term downtrend warning"
+                action = "Consider reducing positions"
+
+            msg = f"""{emoji} *{alert['cross_type']} ALERT!*
+
+*{alert['symbol']}*
+
+📊 SMA 50 has crossed {'above' if 'GOLDEN' in alert['cross_type'] else 'below'} SMA 200!
+
+💰 Current Price: ₹{alert['price']:,.2f}
+📈 SMA 50: ₹{alert['sma50']:,.2f}
+📉 SMA 200: ₹{alert['sma200']:,.2f}
+
+*Meaning:* {meaning}
+*Action:* {action}
+
+_This is a significant technical event!_"""
+
+            send_message(ADMIN_CHAT_ID, msg)
+            logger.info(f"{alert['cross_type']} alert sent for {alert['symbol']}")
+
+    except Exception as e:
+        logger.error(f"Golden/Death cross check error: {e}")
+
+
+def check_rsi_divergence():
+    """
+    Check for RSI divergence patterns (bullish and bearish).
+    Bullish: Price makes lower low, RSI makes higher low
+    Bearish: Price makes higher high, RSI makes lower high
+    """
+    global last_scheduled_alert
+
+    try:
+        now = datetime.now(IST)
+        today_key = now.strftime('%Y-%m-%d')
+        divergence_alerts = []
+
+        for sym in DEFAULT_WATCHLIST:
+            try:
+                alert_key = f"divergence_{sym}_{today_key}"
+                if last_scheduled_alert.get(alert_key):
+                    continue
+
+                df = get_stock_data(sym, period="1mo")
+                if df is None or len(df) < 20:
+                    continue
+
+                # Calculate RSI
+                delta = df['close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / loss
+                rsi = 100 - (100 / (1 + rs))
+
+                if len(rsi) < 10:
+                    continue
+
+                # Get last 10 days data
+                prices = df['close'].tail(10).values
+                rsi_values = rsi.tail(10).values
+
+                # Check for bullish divergence (price lower low, RSI higher low)
+                if prices[-1] < prices[0] and rsi_values[-1] > rsi_values[0]:
+                    if rsi_values[-1] < 40:  # Confirm oversold
+                        divergence_alerts.append({
+                            'symbol': sym,
+                            'type': 'BULLISH DIVERGENCE',
+                            'price': prices[-1],
+                            'rsi': rsi_values[-1],
+                        })
+                        last_scheduled_alert[alert_key] = True
+
+                # Check for bearish divergence (price higher high, RSI lower high)
+                elif prices[-1] > prices[0] and rsi_values[-1] < rsi_values[0]:
+                    if rsi_values[-1] > 60:  # Confirm overbought zone
+                        divergence_alerts.append({
+                            'symbol': sym,
+                            'type': 'BEARISH DIVERGENCE',
+                            'price': prices[-1],
+                            'rsi': rsi_values[-1],
+                        })
+                        last_scheduled_alert[alert_key] = True
+
+            except Exception as e:
+                continue
+
+        for alert in divergence_alerts:
+            if 'BULLISH' in alert['type']:
+                emoji = "🟢📈"
+                meaning = "Price making lower lows but RSI making higher lows"
+                action = "Potential reversal UP - Watch for confirmation"
+            else:
+                emoji = "🔴📉"
+                meaning = "Price making higher highs but RSI making lower highs"
+                action = "Potential reversal DOWN - Consider booking profits"
+
+            msg = f"""{emoji} *{alert['type']} DETECTED!*
+
+*{alert['symbol']}*
+
+💰 Price: ₹{alert['price']:,.2f}
+📊 RSI: {alert['rsi']:.1f}
+
+*What This Means:*
+{meaning}
+
+*Action:* {action}
+
+_Divergence is an early warning signal. Wait for confirmation._"""
+
+            send_message(ADMIN_CHAT_ID, msg)
+            logger.info(f"RSI divergence alert sent for {alert['symbol']}")
+
+    except Exception as e:
+        logger.error(f"RSI divergence check error: {e}")
+
+
+def send_support_resistance_levels():
+    """
+    Send key support and resistance levels for watchlist stocks daily at 8:30 AM.
+    """
+    try:
+        now = datetime.now(IST)
+
+        msg = f"""📊 *DAILY SUPPORT & RESISTANCE LEVELS*
+_{now.strftime('%Y-%m-%d')} IST_
+
+"""
+
+        levels_data = []
+
+        # Get levels for indices first
+        for idx in INDEX_WATCHLIST:
+            try:
+                df = get_stock_data(idx, period="1mo")
+                if df is None or len(df) < 10:
+                    continue
+
+                data = get_index_data(idx)
+                price = data.get('value', 0) if data else df['close'].iloc[-1]
+
+                # Calculate pivot points
+                high = df['high'].tail(5).max()
+                low = df['low'].tail(5).min()
+                close = df['close'].iloc[-1]
+
+                pivot = (high + low + close) / 3
+                r1 = 2 * pivot - low
+                r2 = pivot + (high - low)
+                s1 = 2 * pivot - high
+                s2 = pivot - (high - low)
+
+                levels_data.append({
+                    'symbol': idx,
+                    'price': price,
+                    'pivot': pivot,
+                    'r1': r1, 'r2': r2,
+                    's1': s1, 's2': s2,
+                    'is_index': True
+                })
+
+            except:
+                continue
+
+        # Get levels for top stocks
+        for sym in DEFAULT_WATCHLIST[:10]:  # Top 10 stocks
+            try:
+                df = get_stock_data(sym, period="1mo")
+                if df is None or len(df) < 10:
+                    continue
+
+                info = get_stock_info(sym)
+                price = info.get('price', df['close'].iloc[-1]) if info else df['close'].iloc[-1]
+
+                high = df['high'].tail(5).max()
+                low = df['low'].tail(5).min()
+                close = df['close'].iloc[-1]
+
+                pivot = (high + low + close) / 3
+                r1 = 2 * pivot - low
+                r2 = pivot + (high - low)
+                s1 = 2 * pivot - high
+                s2 = pivot - (high - low)
+
+                levels_data.append({
+                    'symbol': sym,
+                    'price': price,
+                    'pivot': pivot,
+                    'r1': r1, 'r2': r2,
+                    's1': s1, 's2': s2,
+                    'is_index': False
+                })
+
+            except:
+                continue
+
+        # Format message
+        msg += "*INDICES:*\n"
+        for data in levels_data:
+            if data['is_index']:
+                msg += f"""
+*{data['symbol']}* (CMP: {data['price']:,.0f})
+  R2: {data['r2']:,.0f} | R1: {data['r1']:,.0f}
+  Pivot: {data['pivot']:,.0f}
+  S1: {data['s1']:,.0f} | S2: {data['s2']:,.0f}
+"""
+
+        msg += "\n*TOP STOCKS:*\n"
+        for data in levels_data:
+            if not data['is_index']:
+                msg += f"""
+*{data['symbol']}* (₹{data['price']:,.2f})
+  R2: ₹{data['r2']:,.2f} | R1: ₹{data['r1']:,.2f}
+  Pivot: ₹{data['pivot']:,.2f}
+  S1: ₹{data['s1']:,.2f} | S2: ₹{data['s2']:,.2f}
+"""
+
+        msg += """
+*Trading Guide:*
+• Buy near S1/S2 with SL below support
+• Sell near R1/R2 with SL above resistance
+• Breakout above R2 = Strong bullish
+• Breakdown below S2 = Strong bearish"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info("Support/Resistance levels sent")
+
+    except Exception as e:
+        logger.error(f"Support/Resistance levels error: {e}")
+
+
+def send_global_market_summary():
+    """
+    Send global market summary at 8:00 AM with overnight US, Asian markets performance.
+    """
+    try:
+        import yfinance as yf
+
+        now = datetime.now(IST)
+
+        msg = f"""🌍 *GLOBAL MARKET SUMMARY*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*Overnight Performance:*
+
+"""
+
+        global_data = []
+
+        for name, symbol in GLOBAL_INDICES.items():
+            try:
+                ticker = yf.Ticker(symbol)
+                hist = ticker.history(period="2d")
+
+                if len(hist) >= 2:
+                    prev = float(hist['Close'].iloc[-2])
+                    curr = float(hist['Close'].iloc[-1])
+                    change = curr - prev
+                    pct = (change / prev) * 100
+
+                    global_data.append({
+                        'name': name,
+                        'value': curr,
+                        'change': change,
+                        'pct': pct
+                    })
+            except:
+                continue
+
+        # US Markets
+        msg += "*🇺🇸 US MARKETS:*\n"
+        for data in global_data:
+            if data['name'] in ['DOW', 'NASDAQ', 'S&P500']:
+                emoji = "📈" if data['pct'] >= 0 else "📉"
+                msg += f"  {emoji} *{data['name']}*: {data['value']:,.0f} ({data['pct']:+.2f}%)\n"
+
+        # Asian Markets
+        msg += "\n*🌏 ASIAN MARKETS:*\n"
+        for data in global_data:
+            if data['name'] in ['NIKKEI', 'HANGSENG', 'SGX']:
+                emoji = "📈" if data['pct'] >= 0 else "📉"
+                msg += f"  {emoji} *{data['name']}*: {data['value']:,.0f} ({data['pct']:+.2f}%)\n"
+
+        # European Markets
+        msg += "\n*🇪🇺 EUROPE:*\n"
+        for data in global_data:
+            if data['name'] == 'FTSE':
+                emoji = "📈" if data['pct'] >= 0 else "📉"
+                msg += f"  {emoji} *{data['name']}*: {data['value']:,.0f} ({data['pct']:+.2f}%)\n"
+
+        # Calculate overall sentiment
+        positive_markets = sum(1 for d in global_data if d['pct'] > 0)
+        total_markets = len(global_data)
+
+        if positive_markets >= total_markets * 0.7:
+            sentiment = "POSITIVE"
+            sentiment_emoji = "🟢"
+            outlook = "Indian markets likely to open positive"
+        elif positive_markets <= total_markets * 0.3:
+            sentiment = "NEGATIVE"
+            sentiment_emoji = "🔴"
+            outlook = "Indian markets may face pressure"
+        else:
+            sentiment = "MIXED"
+            sentiment_emoji = "🟡"
+            outlook = "Flat to mildly positive/negative opening"
+
+        msg += f"""
+{'='*30}
+*OVERALL SENTIMENT: {sentiment}* {sentiment_emoji}
+📍 {outlook}
+
+_Use this for pre-market analysis._"""
+
+        send_message(ADMIN_CHAT_ID, msg)
+        logger.info("Global market summary sent")
+
+    except Exception as e:
+        logger.error(f"Global market summary error: {e}")
+
+
+def check_earnings_calendar():
+    """
+    Check and alert for upcoming earnings/results of watchlist stocks.
+    Alert 1 day before company reports results.
+    """
+    global last_scheduled_alert
+
+    try:
+        import yfinance as yf
+
+        now = datetime.now(IST)
+        today_key = now.strftime('%Y-%m-%d')
+        tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+
+        earnings_alerts = []
+
+        for sym in DEFAULT_WATCHLIST:
+            try:
+                alert_key = f"earnings_{sym}_{today_key}"
+                if last_scheduled_alert.get(alert_key):
+                    continue
+
+                # Try to get earnings date from yfinance
+                ticker = yf.Ticker(f"{sym}.NS")
+                calendar = ticker.calendar
+
+                if calendar is not None and not calendar.empty:
+                    # Check if earnings date exists
+                    if 'Earnings Date' in calendar.index:
+                        earnings_date = calendar.loc['Earnings Date']
+                        if isinstance(earnings_date, str):
+                            if earnings_date == tomorrow:
+                                info = get_stock_info(sym)
+                                earnings_alerts.append({
+                                    'symbol': sym,
+                                    'date': earnings_date,
+                                    'price': info.get('price', 0) if info else 0,
+                                })
+                                last_scheduled_alert[alert_key] = True
+
+            except Exception as e:
+                continue
+
+        for alert in earnings_alerts:
+            msg = f"""📢 *EARNINGS ALERT!*
+
+*{alert['symbol']}* is reporting results TOMORROW!
+
+📅 Date: {alert['date']}
+💰 Current Price: ₹{alert['price']:,.2f}
+
+*What to do:*
+  ⚠️ Avoid taking new positions before results
+  ⚠️ If holding, consider hedging with options
+  ⚠️ Results can cause 5-15% move in either direction
+
+_Watch for post-result announcement._"""
+
+            send_message(ADMIN_CHAT_ID, msg)
+            logger.info(f"Earnings alert sent for {alert['symbol']}")
+
+    except Exception as e:
+        logger.error(f"Earnings calendar error: {e}")
+
+
+def check_dividend_alerts():
+    """
+    Check for dividend announcements in watchlist stocks.
+    """
+    global last_scheduled_alert
+
+    try:
+        import yfinance as yf
+
+        now = datetime.now(IST)
+        today_key = now.strftime('%Y-%m-%d')
+
+        for sym in DEFAULT_WATCHLIST:
+            try:
+                alert_key = f"dividend_{sym}_{today_key}"
+                if last_scheduled_alert.get(alert_key):
+                    continue
+
+                ticker = yf.Ticker(f"{sym}.NS")
+                dividends = ticker.dividends
+
+                if dividends is not None and len(dividends) > 0:
+                    # Check if recent dividend (within last 7 days)
+                    last_div_date = dividends.index[-1]
+                    days_ago = (now.date() - last_div_date.date()).days
+
+                    if 0 <= days_ago <= 7:
+                        div_amount = dividends.iloc[-1]
+                        info = get_stock_info(sym)
+                        price = info.get('price', 100) if info else 100
+                        div_yield = (div_amount / price * 100) if price else 0
+
+                        msg = f"""💰 *DIVIDEND ANNOUNCEMENT!*
+
+*{sym}* has announced dividend!
+
+📅 Date: {last_div_date.strftime('%Y-%m-%d')}
+💵 Dividend: ₹{div_amount:.2f} per share
+📊 Current Price: ₹{price:,.2f}
+📈 Yield: {div_yield:.2f}%
+
+*Note:*
+  • Check record date for eligibility
+  • Stock may correct post ex-dividend date
+
+_Dividend investors take note!_"""
+
+                        send_message(ADMIN_CHAT_ID, msg)
+                        last_scheduled_alert[alert_key] = True
+                        logger.info(f"Dividend alert sent for {sym}")
+
+            except Exception as e:
+                continue
+
+    except Exception as e:
+        logger.error(f"Dividend alert error: {e}")
+
+
+def check_ipo_and_regulatory_news():
+    """
+    Check for IPO news and RBI/SEBI announcements.
+    """
+    try:
+        # Check for regulatory keywords in news
+        keywords = ["IPO", "RBI", "SEBI", "interest rate", "repo rate",
+                   "monetary policy", "regulation", "FPI limit", "margin"]
+
+        articles = get_market_news(limit=15)
+
+        for article in articles:
+            title = article.get('title', '')
+            description = article.get('description', '')
+            content = (title + " " + description).lower()
+
+            # Check for IPO news
+            if 'ipo' in content and any(word in content for word in ['launch', 'open', 'price', 'gmp', 'subscription']):
+                msg = f"""🆕 *IPO NEWS ALERT!*
+
+*{title}*
+
+{description[:200] if description else ''}...
+
+_Check for GMP and subscription status._"""
+
+                send_message(ADMIN_CHAT_ID, msg)
+                logger.info(f"IPO news alert sent: {title[:30]}")
+                break
+
+            # Check for RBI/SEBI news
+            elif any(word in content for word in ['rbi', 'sebi']) and any(word in content for word in ['announce', 'decision', 'policy', 'change', 'rule']):
+                msg = f"""🏛️ *REGULATORY NEWS ALERT!*
+
+*{title}*
+
+{description[:200] if description else ''}...
+
+_This may impact market sentiment._"""
+
+                send_message(ADMIN_CHAT_ID, msg)
+                logger.info(f"Regulatory news alert sent: {title[:30]}")
+                break
+
+    except Exception as e:
+        logger.error(f"IPO/Regulatory news error: {e}")
+
+
 def send_weekly_report():
     """
     Send comprehensive weekly market analysis report every Saturday at 6 PM IST.
@@ -3163,7 +4018,7 @@ _{now.strftime('%A, %B %d, %Y')}_
 
         msg += "*WATCHLIST ANALYSIS:*\n\n"
 
-        for sym in DEFAULT_WATCHLIST:
+        for sym in DEFAULT_WATCHLIST[:15]:  # Top 15 for report
             df = get_stock_data(sym, period="1mo")
             if df is None:
                 continue
@@ -3366,6 +4221,58 @@ def run_scheduler():
                 if last_scheduled_alert.get('calendar_alert') != today_key:
                     send_calendar_event_alert()
                     last_scheduled_alert['calendar_alert'] = today_key
+
+            # ===== NEW AUTOMATIC FEATURES =====
+
+            # Global Market Summary at 8:00 AM (before market)
+            if current_hour == 8 and current_minute == 0:
+                if last_scheduled_alert.get('global_summary') != today_key:
+                    send_global_market_summary()
+                    last_scheduled_alert['global_summary'] = today_key
+
+            # Support/Resistance Levels at 8:30 AM
+            if current_hour == 8 and current_minute == 30:
+                if last_scheduled_alert.get('sr_levels') != today_key:
+                    send_support_resistance_levels()
+                    last_scheduled_alert['sr_levels'] = today_key
+
+            # Intraday Picks at 9:20 AM (just after market open)
+            if current_hour == 9 and current_minute == 20:
+                if last_scheduled_alert.get('intraday_picks') != today_key:
+                    send_intraday_picks()
+                    last_scheduled_alert['intraday_picks'] = today_key
+
+            # Golden Cross / Death Cross check at 10:00 AM
+            if current_hour == 10 and current_minute == 0:
+                check_golden_death_cross()
+
+            # RSI Divergence check every 2 hours during market
+            if current_minute == 0 and current_hour in [10, 12, 14]:
+                check_rsi_divergence()
+
+            # Earnings Calendar check at 6 PM
+            if current_hour == 18 and current_minute == 0:
+                if last_scheduled_alert.get('earnings_check') != today_key:
+                    check_earnings_calendar()
+                    last_scheduled_alert['earnings_check'] = today_key
+
+            # Dividend alerts check at 6:30 PM
+            if current_hour == 18 and current_minute == 30:
+                if last_scheduled_alert.get('dividend_check') != today_key:
+                    check_dividend_alerts()
+                    last_scheduled_alert['dividend_check'] = today_key
+
+            # IPO and Regulatory News check every 2 hours
+            if current_minute == 30 and current_hour in [9, 11, 13, 15, 17]:
+                check_ipo_and_regulatory_news()
+
+            # ===== WEEKEND ALERTS =====
+
+            # Sunday: Weekly Swing Trade Ideas at 7 PM
+            if current_day == 6 and current_hour == 19 and current_minute == 0:  # Sunday
+                if last_scheduled_alert.get('swing_ideas') != today_key:
+                    send_swing_trade_ideas()
+                    last_scheduled_alert['swing_ideas'] = today_key
 
             time.sleep(60)  # Check every minute
 

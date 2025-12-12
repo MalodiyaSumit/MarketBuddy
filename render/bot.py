@@ -2733,7 +2733,7 @@ _Use /calendar for upcoming market events_"""
 
 """
 
-        msg += """{'='*30}
+        msg += f"""{'='*30}
 
 ⚠️ *DISCLAIMER:*
 This is not investment advice. Always do your own research before investing in any IPO. Past performance doesn't guarantee future results.

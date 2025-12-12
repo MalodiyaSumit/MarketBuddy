@@ -2467,67 +2467,109 @@ _Gift Nifty trades on SGX from 6:30 AM to 11:30 PM IST_"""
 
 def get_ipo_data():
     """
-    Fetch upcoming and current IPO data from NSE.
+    Fetch upcoming and current IPO data from multiple sources.
     Returns mainboard IPOs only (not SME).
     """
     try:
-        # NSE IPO endpoint
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
         }
 
-        # Sample IPO data structure (NSE doesn't have direct API, so we create structure)
-        # In production, this would scrape from investorgain, chittorgarh or NSE
         ipos = []
-
-        # Try to fetch from reliable sources
-        try:
-            # Fetch from Chittorgarh IPO page (common source)
-            url = "https://www.chittorgarh.com/ipo/ipo_dashboard.asp"
-            # Note: Real implementation would scrape this, for now return sample structure
-        except:
-            pass
-
-        # Return sample IPO data structure for demonstration
-        # In production, this would be fetched from NSE/Chittorgarh/InvestorGain
         now = datetime.now(IST)
 
-        # IPO Calendar (would be fetched dynamically)
-        sample_ipos = [
-            {
-                "name": "Sample Mainboard IPO",
-                "type": "MAINBOARD",
-                "status": "UPCOMING",
-                "price_band": "₹200-220",
-                "lot_size": 65,
-                "issue_size": "₹1500 Cr",
-                "open_date": (now + timedelta(days=5)).strftime('%Y-%m-%d'),
-                "close_date": (now + timedelta(days=8)).strftime('%Y-%m-%d'),
-                "listing_date": (now + timedelta(days=12)).strftime('%Y-%m-%d'),
-                "gmp": 50,  # Grey Market Premium in Rs
-                "subscription": {"retail": 0, "nii": 0, "qib": 0},  # Before open
-                "financials": {
-                    "revenue": [150, 200, 280, 350],  # Last 4 years in Cr
-                    "net_profit": [10, 18, 30, 45],
-                    "debt": [20, 25, 30, 35],
-                },
-                "positives": [
-                    "Strong revenue growth (30%+ CAGR)",
-                    "Leader in niche market",
-                    "Experienced management",
-                ],
-                "negatives": [
-                    "High valuation compared to peers",
-                    "Customer concentration risk",
-                ],
-                "recommendation": "SUBSCRIBE",
-                "recommendation_reason": "Good growth, reasonable valuations"
-            }
-        ]
+        # Try to fetch from Investorgain API (most reliable for GMP)
+        try:
+            gmp_url = "https://www.investorgain.com/report/live-ipo-gmp/331/"
+            response = requests.get(gmp_url, headers=headers, timeout=15)
 
-        return sample_ipos
+            if response.status_code == 200:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(response.text, 'html.parser')
+
+                # Find IPO table
+                table = soup.find('table', {'id': 'mainTable'}) or soup.find('table')
+
+                if table:
+                    rows = table.find_all('tr')[1:]  # Skip header
+
+                    for row in rows[:10]:  # Limit to 10 IPOs
+                        cols = row.find_all('td')
+                        if len(cols) >= 5:
+                            try:
+                                name = cols[0].get_text(strip=True)
+
+                                # Skip SME IPOs
+                                if 'SME' in name.upper():
+                                    continue
+
+                                price_text = cols[1].get_text(strip=True) if len(cols) > 1 else "N/A"
+                                gmp_text = cols[2].get_text(strip=True) if len(cols) > 2 else "0"
+
+                                # Parse GMP
+                                gmp = 0
+                                try:
+                                    gmp = int(''.join(filter(str.isdigit, gmp_text.split('.')[0])) or '0')
+                                except:
+                                    gmp = 0
+
+                                # Determine status
+                                status = "UPCOMING"
+                                status_text = cols[4].get_text(strip=True).lower() if len(cols) > 4 else ""
+                                if 'open' in status_text:
+                                    status = "OPEN"
+                                elif 'close' in status_text or 'listed' in status_text:
+                                    status = "CLOSED"
+
+                                ipo_data = {
+                                    "name": name,
+                                    "type": "MAINBOARD",
+                                    "status": status,
+                                    "price_band": price_text,
+                                    "lot_size": 0,
+                                    "issue_size": "N/A",
+                                    "open_date": "Check NSE",
+                                    "close_date": "Check NSE",
+                                    "listing_date": "Check NSE",
+                                    "gmp": gmp,
+                                    "subscription": {"retail": 0, "nii": 0, "qib": 0},
+                                    "financials": {},
+                                    "positives": [],
+                                    "negatives": [],
+                                }
+
+                                # Add GMP-based assessment
+                                if gmp > 0:
+                                    try:
+                                        price_upper = int(''.join(filter(str.isdigit, price_text.split('-')[-1].split('.')[0])) or '0')
+                                        if price_upper > 0:
+                                            gmp_pct = (gmp / price_upper) * 100
+                                            if gmp_pct > 30:
+                                                ipo_data['positives'].append(f"Strong GMP: ₹{gmp} ({gmp_pct:.1f}%)")
+                                            elif gmp_pct > 10:
+                                                ipo_data['positives'].append(f"Good GMP: ₹{gmp} ({gmp_pct:.1f}%)")
+                                            elif gmp_pct < 0:
+                                                ipo_data['negatives'].append(f"Negative GMP: ₹{gmp}")
+                                    except:
+                                        pass
+
+                                ipos.append(ipo_data)
+
+                            except Exception as e:
+                                logger.error(f"Error parsing IPO row: {e}")
+                                continue
+
+        except Exception as e:
+            logger.error(f"Error fetching from Investorgain: {e}")
+
+        # If no IPOs found, return empty list with message
+        if not ipos:
+            logger.info("No IPOs found from web sources")
+            return []
+
+        return ipos
 
     except Exception as e:
         logger.error(f"IPO data fetch error: {e}")

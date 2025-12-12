@@ -9,3 +9,5 @@ scikit-learn
 matplotlib
 mplfinance
 pytz
+beautifulsoup4
+lxml

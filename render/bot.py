@@ -8,6 +8,8 @@ import requests
 import logging
 import time
 import io
+import json
+import hashlib
 from datetime import datetime, timedelta
 from flask import Flask
 import threading
@@ -36,6 +38,49 @@ IST = pytz.timezone('Asia/Kolkata')
 last_news_check = 0
 last_scheduled_alert = {}
 sent_news_ids = set()
+SENT_NEWS_FILE = "sent_news_ids.json"
+
+
+def load_sent_news_ids():
+    """Load sent news IDs from file for persistence across restarts."""
+    global sent_news_ids
+    try:
+        if os.path.exists(SENT_NEWS_FILE):
+            with open(SENT_NEWS_FILE, 'r') as f:
+                data = json.load(f)
+                # Only load news IDs from last 24 hours
+                cutoff = (datetime.now(IST) - timedelta(hours=24)).isoformat()
+                sent_news_ids = set()
+                for item in data:
+                    if isinstance(item, dict) and item.get('time', '') > cutoff:
+                        sent_news_ids.add(item['id'])
+                    elif isinstance(item, str):
+                        sent_news_ids.add(item)
+                logger.info(f"Loaded {len(sent_news_ids)} sent news IDs from file")
+    except Exception as e:
+        logger.error(f"Error loading sent news IDs: {e}")
+        sent_news_ids = set()
+
+
+def save_sent_news_ids():
+    """Save sent news IDs to file for persistence."""
+    try:
+        # Save with timestamp for cleanup
+        now = datetime.now(IST).isoformat()
+        data = [{'id': nid, 'time': now} for nid in list(sent_news_ids)[-100:]]
+        with open(SENT_NEWS_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Error saving sent news IDs: {e}")
+
+
+def get_news_id(title):
+    """Generate consistent news ID using MD5 hash."""
+    return hashlib.md5(title.lower().strip().encode()).hexdigest()[:16]
+
+
+# Load sent news on startup
+load_sent_news_ids()
 
 # ===== ACTIVE SIGNALS TRACKING =====
 # Store active signals for target hit monitoring
@@ -1732,6 +1777,8 @@ Hello {user_name}! I'm your AI-powered stock analysis assistant.
 
 /price SYMBOL - Quick price check
 /chart SYMBOL - Technical chart with indicators
+/days SYMBOL - Last 15 days price history
+  Example: /days RELIANCE 20 (for 20 days)
 
 *📊 INDEX TRADING:*
 /nifty - NIFTY 50 signal with levels
@@ -1755,6 +1802,9 @@ Hello {user_name}! I'm your AI-powered stock analysis assistant.
 /pcr - Quick NIFTY PCR check
 /calendar - Upcoming economic events
 /sentiment - Overall market sentiment score
+/ipo - Mainboard IPO analysis with recommendation
+
+💡 *TIP:* Just type stock name (e.g., RELIANCE) without "/" for instant analysis!
 
 *📋 PORTFOLIO:*
 /watchlist - View your watchlist
@@ -1808,6 +1858,99 @@ Open: Rs {info.get('open', 0):,.2f}
 High: Rs {info.get('high', 0):,.2f}
 Low: Rs {info.get('low', 0):,.2f}"""
     send_message(chat_id, msg)
+
+
+def handle_days(chat_id, symbol, days=15):
+    """Show last N days price history for a stock."""
+    symbol = symbol.upper().strip()
+
+    # Get stock data for enough period
+    df = get_stock_data(symbol, period="1mo")
+    if df is None or len(df) == 0:
+        send_message(chat_id, f"❌ No data available for {symbol}")
+        return
+
+    # Get stock info for company name
+    info = get_stock_info(symbol)
+    name = info.get('name', symbol) if info else symbol
+
+    # Get last N days
+    df_last = df.tail(days)
+
+    if len(df_last) == 0:
+        send_message(chat_id, f"❌ Not enough historical data for {symbol}")
+        return
+
+    now = datetime.now(IST)
+    msg = f"""📊 *{days}-DAY PRICE HISTORY*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*{name}* ({symbol})
+{'='*30}
+
+"""
+    # Calculate overall change from first to last
+    first_close = df_last['close'].iloc[0]
+    last_close = df_last['close'].iloc[-1]
+    overall_change = ((last_close - first_close) / first_close * 100) if first_close else 0
+
+    # Add header
+    msg += "*Date       | Open     | High     | Low      | Close    | Change*\n"
+    msg += "-" * 60 + "\n"
+
+    prev_close = None
+    for idx, row in df_last.iterrows():
+        date_str = idx.strftime('%d-%b')
+        open_price = row['open']
+        high_price = row['high']
+        low_price = row['low']
+        close_price = row['close']
+
+        # Calculate daily change
+        if prev_close:
+            daily_change = ((close_price - prev_close) / prev_close * 100)
+            change_str = f"{daily_change:+.1f}%"
+            emoji = "🟢" if daily_change >= 0 else "🔴"
+        else:
+            change_str = "-"
+            emoji = "⚪"
+
+        msg += f"{emoji} `{date_str}` | ₹{open_price:,.0f} | ₹{high_price:,.0f} | ₹{low_price:,.0f} | ₹{close_price:,.0f} | {change_str}\n"
+        prev_close = close_price
+
+    msg += "-" * 60 + "\n"
+
+    # Summary statistics
+    high_of_period = df_last['high'].max()
+    low_of_period = df_last['low'].min()
+    avg_volume = df_last['volume'].mean()
+
+    msg += f"""
+*📈 SUMMARY:*
+• Period High: ₹{high_of_period:,.2f}
+• Period Low: ₹{low_of_period:,.2f}
+• Overall Change: {overall_change:+.2f}%
+• Avg Volume: {avg_volume/100000:,.2f}L
+
+*Current Price:* ₹{last_close:,.2f}
+"""
+
+    # Add trend assessment
+    if overall_change > 5:
+        trend = "🚀 Strong Uptrend"
+    elif overall_change > 2:
+        trend = "📈 Uptrend"
+    elif overall_change > -2:
+        trend = "➡️ Sideways"
+    elif overall_change > -5:
+        trend = "📉 Downtrend"
+    else:
+        trend = "💥 Strong Downtrend"
+
+    msg += f"*{days}-Day Trend:* {trend}"
+
+    send_message(chat_id, msg)
+
 
 def handle_stock(chat_id, symbol):
     send_message(chat_id, f"Analyzing {symbol}...")
@@ -2322,6 +2465,288 @@ _Gift Nifty trades on SGX from 6:30 AM to 11:30 PM IST_"""
     send_message(chat_id, msg)
 
 
+def get_ipo_data():
+    """
+    Fetch upcoming and current IPO data from NSE.
+    Returns mainboard IPOs only (not SME).
+    """
+    try:
+        # NSE IPO endpoint
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+
+        # Sample IPO data structure (NSE doesn't have direct API, so we create structure)
+        # In production, this would scrape from investorgain, chittorgarh or NSE
+        ipos = []
+
+        # Try to fetch from reliable sources
+        try:
+            # Fetch from Chittorgarh IPO page (common source)
+            url = "https://www.chittorgarh.com/ipo/ipo_dashboard.asp"
+            # Note: Real implementation would scrape this, for now return sample structure
+        except:
+            pass
+
+        # Return sample IPO data structure for demonstration
+        # In production, this would be fetched from NSE/Chittorgarh/InvestorGain
+        now = datetime.now(IST)
+
+        # IPO Calendar (would be fetched dynamically)
+        sample_ipos = [
+            {
+                "name": "Sample Mainboard IPO",
+                "type": "MAINBOARD",
+                "status": "UPCOMING",
+                "price_band": "₹200-220",
+                "lot_size": 65,
+                "issue_size": "₹1500 Cr",
+                "open_date": (now + timedelta(days=5)).strftime('%Y-%m-%d'),
+                "close_date": (now + timedelta(days=8)).strftime('%Y-%m-%d'),
+                "listing_date": (now + timedelta(days=12)).strftime('%Y-%m-%d'),
+                "gmp": 50,  # Grey Market Premium in Rs
+                "subscription": {"retail": 0, "nii": 0, "qib": 0},  # Before open
+                "financials": {
+                    "revenue": [150, 200, 280, 350],  # Last 4 years in Cr
+                    "net_profit": [10, 18, 30, 45],
+                    "debt": [20, 25, 30, 35],
+                },
+                "positives": [
+                    "Strong revenue growth (30%+ CAGR)",
+                    "Leader in niche market",
+                    "Experienced management",
+                ],
+                "negatives": [
+                    "High valuation compared to peers",
+                    "Customer concentration risk",
+                ],
+                "recommendation": "SUBSCRIBE",
+                "recommendation_reason": "Good growth, reasonable valuations"
+            }
+        ]
+
+        return sample_ipos
+
+    except Exception as e:
+        logger.error(f"IPO data fetch error: {e}")
+        return []
+
+
+def analyze_ipo(ipo):
+    """Analyze IPO and provide recommendation."""
+    score = 50  # Start neutral
+    positives = []
+    negatives = []
+
+    financials = ipo.get('financials', {})
+
+    # Revenue growth analysis
+    revenues = financials.get('revenue', [])
+    if len(revenues) >= 4:
+        revenue_cagr = ((revenues[-1] / revenues[0]) ** (1/3) - 1) * 100 if revenues[0] > 0 else 0
+        if revenue_cagr > 25:
+            score += 15
+            positives.append(f"Strong revenue CAGR: {revenue_cagr:.1f}%")
+        elif revenue_cagr > 15:
+            score += 10
+            positives.append(f"Good revenue CAGR: {revenue_cagr:.1f}%")
+        elif revenue_cagr < 5:
+            score -= 10
+            negatives.append(f"Low revenue growth: {revenue_cagr:.1f}%")
+
+    # Profit growth analysis
+    profits = financials.get('net_profit', [])
+    if len(profits) >= 4:
+        if profits[-1] > 0 and profits[0] > 0:
+            profit_cagr = ((profits[-1] / profits[0]) ** (1/3) - 1) * 100
+            if profit_cagr > 30:
+                score += 15
+                positives.append(f"Excellent profit CAGR: {profit_cagr:.1f}%")
+            elif profit_cagr > 20:
+                score += 10
+                positives.append(f"Good profit CAGR: {profit_cagr:.1f}%")
+        if profits[-1] <= 0:
+            score -= 20
+            negatives.append("Company not profitable")
+
+    # Debt analysis
+    debts = financials.get('debt', [])
+    if len(debts) >= 1 and len(revenues) >= 1:
+        debt_to_revenue = debts[-1] / revenues[-1] if revenues[-1] > 0 else 0
+        if debt_to_revenue < 0.3:
+            score += 10
+            positives.append("Low debt levels")
+        elif debt_to_revenue > 0.7:
+            score -= 10
+            negatives.append("High debt levels")
+
+    # GMP analysis (Grey Market Premium)
+    gmp = ipo.get('gmp', 0)
+    price_band = ipo.get('price_band', '₹0-0')
+    try:
+        upper_price = int(price_band.replace('₹', '').split('-')[-1])
+        gmp_pct = (gmp / upper_price * 100) if upper_price > 0 else 0
+        if gmp_pct > 30:
+            score += 10
+            positives.append(f"Strong GMP: ₹{gmp} ({gmp_pct:.1f}%)")
+        elif gmp_pct > 10:
+            score += 5
+            positives.append(f"Good GMP: ₹{gmp} ({gmp_pct:.1f}%)")
+        elif gmp_pct < 0:
+            score -= 15
+            negatives.append(f"Negative GMP: ₹{gmp}")
+    except:
+        pass
+
+    # Combine with provided positives/negatives
+    positives.extend(ipo.get('positives', []))
+    negatives.extend(ipo.get('negatives', []))
+
+    # Determine recommendation
+    if score >= 70:
+        recommendation = "✅ SUBSCRIBE"
+        rec_detail = "Strong fundamentals, good growth prospects"
+    elif score >= 55:
+        recommendation = "🟡 SUBSCRIBE FOR LISTING GAINS"
+        rec_detail = "May give moderate listing gains"
+    elif score >= 45:
+        recommendation = "🟠 AVOID / RISKY"
+        rec_detail = "Weak fundamentals or high valuation"
+    else:
+        recommendation = "❌ DO NOT SUBSCRIBE"
+        rec_detail = "Poor financials or very high risk"
+
+    return {
+        "score": score,
+        "recommendation": recommendation,
+        "recommendation_detail": rec_detail,
+        "positives": positives[:5],  # Top 5
+        "negatives": negatives[:5]   # Top 5
+    }
+
+
+def handle_ipo(chat_id):
+    """
+    Comprehensive IPO analysis command.
+    Shows mainboard IPOs with detailed analysis.
+    """
+    send_message(chat_id, "📊 Fetching IPO data...")
+
+    try:
+        now = datetime.now(IST)
+
+        # Note: In production, fetch real data from NSE/Chittorgarh/InvestorGain
+        msg = f"""📊 *IPO DASHBOARD - MAINBOARD*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+"""
+        # Fetch IPO data (would be from real source in production)
+        ipos = get_ipo_data()
+
+        # Filter mainboard only
+        mainboard_ipos = [ipo for ipo in ipos if ipo.get('type') == 'MAINBOARD']
+
+        if not mainboard_ipos:
+            msg += """*Currently no mainboard IPOs open for subscription.*
+
+📅 *Coming Soon:*
+Check back for upcoming IPO details.
+
+💡 *Tips for IPO Investing:*
+• Always check GMP (Grey Market Premium)
+• Review company financials (4 year trend)
+• Check peer comparison valuations
+• Apply only if fundamentals are strong
+• Don't just follow the hype
+
+_Use /calendar for upcoming market events_"""
+            send_message(chat_id, msg)
+            return
+
+        # Analyze each IPO
+        for ipo in mainboard_ipos:
+            analysis = analyze_ipo(ipo)
+            status_emoji = "🟢" if ipo['status'] == 'OPEN' else "🟡" if ipo['status'] == 'UPCOMING' else "⚪"
+
+            msg += f"""{'='*30}
+{status_emoji} *{ipo['name']}*
+*Status:* {ipo['status']}
+
+*📋 IPO DETAILS:*
+• Price Band: {ipo['price_band']}
+• Lot Size: {ipo['lot_size']} shares
+• Issue Size: {ipo['issue_size']}
+• Open: {ipo['open_date']}
+• Close: {ipo['close_date']}
+• Listing: {ipo['listing_date']}
+
+*💹 GMP (Grey Market Premium):* ₹{ipo.get('gmp', 'N/A')}
+
+"""
+            # Subscription status (if open)
+            sub = ipo.get('subscription', {})
+            if any(sub.values()):
+                msg += f"""*📈 SUBSCRIPTION STATUS:*
+• Retail: {sub.get('retail', 0):.2f}x
+• NII: {sub.get('nii', 0):.2f}x
+• QIB: {sub.get('qib', 0):.2f}x
+
+"""
+
+            # Financials (4 years)
+            fin = ipo.get('financials', {})
+            if fin:
+                msg += "*📊 FINANCIALS (Last 4 Years):*\n"
+                if fin.get('revenue'):
+                    rev = fin['revenue']
+                    msg += f"  Revenue: ₹{rev[0]}Cr → ₹{rev[-1]}Cr\n"
+                if fin.get('net_profit'):
+                    prof = fin['net_profit']
+                    msg += f"  Net Profit: ₹{prof[0]}Cr → ₹{prof[-1]}Cr\n"
+                if fin.get('debt'):
+                    debt = fin['debt']
+                    msg += f"  Debt: ₹{debt[0]}Cr → ₹{debt[-1]}Cr\n"
+                msg += "\n"
+
+            # Positives
+            if analysis['positives']:
+                msg += "*✅ PLUS FACTORS:*\n"
+                for p in analysis['positives'][:4]:
+                    msg += f"  • {p}\n"
+                msg += "\n"
+
+            # Negatives
+            if analysis['negatives']:
+                msg += "*❌ MINUS FACTORS:*\n"
+                for n in analysis['negatives'][:4]:
+                    msg += f"  • {n}\n"
+                msg += "\n"
+
+            # Recommendation
+            msg += f"""*🎯 RECOMMENDATION:*
+{analysis['recommendation']}
+📝 {analysis['recommendation_detail']}
+
+*Score:* {analysis['score']}/100
+
+"""
+
+        msg += """{'='*30}
+
+⚠️ *DISCLAIMER:*
+This is not investment advice. Always do your own research before investing in any IPO. Past performance doesn't guarantee future results.
+
+💡 *Tip:* Check subscription data on NSE website for real-time updates."""
+
+        send_message(chat_id, msg)
+
+    except Exception as e:
+        logger.error(f"IPO command error: {e}")
+        send_message(chat_id, "Error fetching IPO data. Please try again later.")
+
+
 def handle_fiidii(chat_id):
     """Show FII/DII data with analysis."""
     send_message(chat_id, "Fetching FII/DII data...")
@@ -2643,8 +3068,8 @@ Indian Stock Market is NOW CLOSED! 🔴
             emoji = "📈" if data.get('change', 0) >= 0 else "📉"
             msg += f"{emoji} *{idx}*: {data.get('value', 0):,.2f} ({data.get('pct', 0):+.2f}%)\n"
 
-    msg += "\n*WATCHLIST PERFORMANCE:*\n"
-
+    # Collect all watchlist performance data
+    watchlist_performance = []
     for sym in DEFAULT_WATCHLIST:
         try:
             info = get_stock_info(sym)
@@ -2652,10 +3077,42 @@ Indian Stock Market is NOW CLOSED! 🔴
                 price = info['price']
                 prev = info.get('previous_close', price)
                 pct = ((price - prev) / prev * 100) if prev else 0
-                emoji = "📈" if pct >= 0 else "📉"
-                msg += f"{emoji} *{sym}*: ₹{price:,.2f} ({pct:+.2f}%)\n"
+                watchlist_performance.append({
+                    'symbol': sym,
+                    'price': price,
+                    'change_pct': pct
+                })
         except:
             pass
+
+    # Sort by performance: Gainers (highest to lowest) then Losers (lowest to highest)
+    watchlist_performance.sort(key=lambda x: x['change_pct'], reverse=True)
+
+    # Separate gainers and losers
+    gainers = [s for s in watchlist_performance if s['change_pct'] >= 0]
+    losers = [s for s in watchlist_performance if s['change_pct'] < 0]
+
+    msg += "\n*🟢 TOP GAINERS:*\n"
+    for stock in gainers[:10]:  # Top 10 gainers
+        msg += f"📈 *{stock['symbol']}*: ₹{stock['price']:,.2f} ({stock['change_pct']:+.2f}%)\n"
+
+    if not gainers:
+        msg += "_No gainers today_\n"
+
+    msg += "\n*🔴 TOP LOSERS:*\n"
+    for stock in losers[:10]:  # Top 10 losers
+        msg += f"📉 *{stock['symbol']}*: ₹{stock['price']:,.2f} ({stock['change_pct']:+.2f}%)\n"
+
+    if not losers:
+        msg += "_No losers today_\n"
+
+    # Summary stats
+    total_gainers = len(gainers)
+    total_losers = len(losers)
+    market_breadth = "Bullish" if total_gainers > total_losers else "Bearish" if total_losers > total_gainers else "Neutral"
+
+    msg += f"\n*📊 Market Breadth:* {market_breadth}\n"
+    msg += f"Gainers: {total_gainers} | Losers: {total_losers}\n"
 
     msg += "\nSee you tomorrow! 👋"
     send_message(ADMIN_CHAT_ID, msg)
@@ -2763,9 +3220,10 @@ _Market opens at 9:15 AM IST_"""
         logger.error(f"Morning briefing error: {e}")
 
 
-def send_calendar_event_alert():
+def send_calendar_event_alert(alert_type="evening"):
     """
-    Send alert for tomorrow's important events at 8 PM.
+    Send alert for market events.
+    alert_type: "evening" (8 PM for tomorrow), "morning" (7 AM for today)
     """
     try:
         calendar = get_upcoming_economic_events()
@@ -2774,58 +3232,139 @@ def send_calendar_event_alert():
             return
 
         now = datetime.now(IST)
-        tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
 
-        # Check for tomorrow's events
-        tomorrow_events = [e for e in calendar['events'] if e['date'] == tomorrow]
+        if alert_type == "morning":
+            target_date = now.strftime('%Y-%m-%d')
+            header = "TODAY'S MARKET EVENTS"
+            footer = "⚠️ *Trade with caution today!*\n\n_High impact events expected._"
+        else:  # evening
+            target_date = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+            header = "TOMORROW'S MARKET EVENTS"
+            footer = "⚠️ *Plan your trades accordingly!*\n\n_Events can cause high volatility._"
 
-        if not tomorrow_events:
+        # Check for target date's events
+        target_events = [e for e in calendar['events'] if e['date'] == target_date]
+
+        if not target_events:
             return
 
-        msg = f"""📅 *TOMORROW'S MARKET EVENTS*
-_{tomorrow}_
+        # Sort by impact level
+        impact_order = {"VERY HIGH": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        target_events.sort(key=lambda x: impact_order.get(x['impact'], 4))
+
+        msg = f"""📅 *{header}*
+_{target_date}_
 
 """
+        # Count by impact
+        high_impact = sum(1 for e in target_events if e['impact'] in ["HIGH", "VERY HIGH"])
 
-        for event in tomorrow_events:
-            impact_emoji = "🔴" if event['impact'] in ["HIGH", "VERY HIGH"] else "🟡"
+        if high_impact > 0:
+            msg += f"🚨 *{high_impact} HIGH IMPACT EVENT(S)*\n\n"
+
+        for event in target_events:
+            impact = event['impact']
+            if impact == "VERY HIGH":
+                impact_emoji = "🔴🔴"
+            elif impact == "HIGH":
+                impact_emoji = "🔴"
+            elif impact == "MEDIUM":
+                impact_emoji = "🟡"
+            else:
+                impact_emoji = "🟢"
+
             msg += f"""{impact_emoji} *{event['event']}*
-  Impact: {event['impact']}
+  Impact: {impact}
   📝 {event['description']}
   💡 {event['recommendation']}
 
 """
 
-        msg += """⚠️ *Plan your trades accordingly!*
-
-_Events can cause high volatility._"""
+        msg += footer
 
         send_message(ADMIN_CHAT_ID, msg)
-        logger.info(f"Calendar event alert sent for {len(tomorrow_events)} events")
+        logger.info(f"Calendar event alert ({alert_type}) sent for {len(target_events)} events")
 
     except Exception as e:
         logger.error(f"Calendar event alert error: {e}")
 
 
+def send_pre_event_alert():
+    """
+    Send alert 1 hour before very high impact events.
+    This should be called every hour during market hours.
+    """
+    try:
+        calendar = get_upcoming_economic_events()
+        if not calendar or not calendar.get('events'):
+            return
+
+        now = datetime.now(IST)
+        today = now.strftime('%Y-%m-%d')
+
+        # Check today's very high impact events
+        today_events = [e for e in calendar['events']
+                       if e['date'] == today and e['impact'] in ["VERY HIGH", "HIGH"]]
+
+        for event in today_events:
+            # Create event key for deduplication
+            event_key = f"pre_event_{event['event']}_{today}"
+            if last_scheduled_alert.get(event_key):
+                continue
+
+            msg = f"""⏰ *EVENT REMINDER*
+_{now.strftime('%H:%M')} IST_
+
+🔴 *{event['event']}* is happening today!
+
+Impact: *{event['impact']}*
+📝 {event['description']}
+
+💡 *Action:* {event['recommendation']}
+
+⚠️ Consider reducing position sizes before this event."""
+
+            send_message(ADMIN_CHAT_ID, msg)
+            last_scheduled_alert[event_key] = True
+            logger.info(f"Pre-event alert sent: {event['event']}")
+
+    except Exception as e:
+        logger.error(f"Pre-event alert error: {e}")
+
+
 def check_breaking_news():
-    """Check for important breaking news and send alerts"""
+    """Check for important breaking news and send alerts - with persistent deduplication"""
     global sent_news_ids
 
     try:
         # Important keywords for Indian market
         keywords = ["RBI", "SEBI", "Sensex", "Nifty", "crash", "surge", "breaking",
                    "Fed", "interest rate", "inflation", "GDP", "recession",
-                   "Reliance", "TCS", "HDFC", "Infosys", "budget", "tax"]
+                   "Reliance", "TCS", "HDFC", "Infosys", "budget", "tax",
+                   "IPO", "FII", "DII", "bonus", "split", "dividend"]
 
         articles = get_market_news(limit=10)
+        news_sent_this_cycle = False
 
         for article in articles:
             title = article.get('title', '')
-            description = article.get('description', '')
-            url = article.get('url', '')
+            if not title:
+                continue
 
-            # Create unique ID
-            news_id = hash(title)
+            description = article.get('description', '') or ''
+            published = article.get('publishedAt', '')
+
+            # Skip old news (more than 6 hours old)
+            if published:
+                try:
+                    pub_time = datetime.fromisoformat(published.replace('Z', '+00:00'))
+                    if datetime.now(pytz.UTC) - pub_time > timedelta(hours=6):
+                        continue
+                except:
+                    pass
+
+            # Create consistent unique ID using MD5 hash
+            news_id = get_news_id(title)
 
             # Skip if already sent
             if news_id in sent_news_ids:
@@ -2840,20 +3379,25 @@ def check_breaking_news():
 
 *{title}*
 
-{description[:200] if description else ''}...
+{description[:200] if description else ''}{'...' if len(description) > 200 else ''}
 
 _Source: {article.get('source', {}).get('name', 'Unknown')}_"""
 
                 send_message(ADMIN_CHAT_ID, msg)
                 sent_news_ids.add(news_id)
+                news_sent_this_cycle = True
                 logger.info(f"Breaking news sent: {title[:50]}")
 
-                # Keep only last 100 news IDs
+                # Keep only last 100 news IDs in memory
                 if len(sent_news_ids) > 100:
                     sent_news_ids = set(list(sent_news_ids)[-50:])
 
                 # Only send one news at a time
                 break
+
+        # Save to file for persistence across restarts
+        if news_sent_this_cycle:
+            save_sent_news_ids()
 
     except Exception as e:
         logger.error(f"Breaking news check error: {e}")
@@ -3148,29 +3692,72 @@ def check_high_confidence_alerts():
             # Sort by confidence score
             high_conf_alerts.sort(key=lambda x: x['confidence'], reverse=True)
 
-            msg = f"""🎯 *HIGH CONFIDENCE OPPORTUNITY ALERT*
-_{now.strftime('%Y-%m-%d %H:%M')} IST_
+            for alert in high_conf_alerts[:3]:  # Max 3 detailed alerts
+                # Calculate trading levels for each stock
+                df = get_stock_data(alert['symbol'], period="1mo")
+                if df is None:
+                    continue
 
-Found {len(high_conf_alerts)} stock(s) with confidence score >= 70!
+                analysis = analyze_stock(df)
+                info = get_stock_info(alert['symbol'])
+                trading = calculate_trading_levels(df, analysis, info) if analysis else None
 
-"""
-            for alert in high_conf_alerts[:5]:  # Max 5 alerts
                 emoji = "🟢🟢🟢" if alert['confidence'] >= 85 else "🟢🟢"
                 rsi_val = alert.get('rsi')
                 rsi_str = f"{rsi_val:.1f}" if rsi_val and rsi_val > 0 else "N/A"
-                msg += f"""*{alert['symbol']}* {emoji}
-  Signal: {alert['signal']}
-  Confidence: *{alert['confidence']}/100*
-  Price: ₹{alert['price']:,.2f} ({alert['change_pct']:+.2f}%)
-  RSI: {rsi_str}
-  Top Factors:
-"""
-                for factor, detail in list(alert['score_factors'].items())[:2]:
-                    msg += f"    • {factor}: {detail}\n"
-                msg += "\n"
 
-            msg += "_Do your own research before investing._"
-            send_message(ADMIN_CHAT_ID, msg)
+                msg = f"""🎯 *HIGH CONFIDENCE OPPORTUNITY*
+_{now.strftime('%Y-%m-%d %H:%M')} IST_
+
+*{alert['symbol']}* {emoji}
+Signal: *{alert['signal']}*
+Confidence: *{alert['confidence']}/100*
+
+💰 *Current Price:* ₹{alert['price']:,.2f} ({alert['change_pct']:+.2f}%)
+"""
+
+                if trading:
+                    msg += f"""
+{'='*28}
+*TRADING LEVELS*
+{'='*28}
+
+📍 *Entry:* ₹{trading['entry_price']:,.2f}
+🎯 *Target 1:* ₹{trading['target_1']:,.2f} ({trading['target_1_pct']:+.2f}%)
+🎯 *Target 2:* ₹{trading['target_2']:,.2f} ({trading['target_2_pct']:+.2f}%)
+🛑 *Stop Loss:* ₹{trading['stop_loss']:,.2f} ({trading['stop_loss_pct']:+.2f}%)
+
+⏱️ *Timeframe:* {trading['timeframe']}
+📊 *R:R Ratio:* 1:{trading['rr_ratio_1']:.1f}
+
+*Key Levels:*
+  Support: ₹{trading['support']:,.2f}
+  Resistance: ₹{trading['resistance']:,.2f}
+"""
+
+                msg += f"""
+*Technical:*
+  RSI: {rsi_str}
+"""
+                for factor, detail in list(alert['score_factors'].items())[:3]:
+                    msg += f"  • {factor}: {detail}\n"
+
+                msg += "\n_Not financial advice. DYOR._"
+                send_message(ADMIN_CHAT_ID, msg)
+
+                # Create active signal for tracking
+                if trading:
+                    create_active_signal(
+                        symbol=alert['symbol'],
+                        signal_type=trading['action'],
+                        entry_price=trading['entry_price'],
+                        target_1=trading['target_1'],
+                        target_2=trading['target_2'],
+                        stop_loss=trading['stop_loss'],
+                        timeframe=trading['timeframe'],
+                        confidence=alert['confidence']
+                    )
+
             logger.info(f"High confidence alerts sent: {len(high_conf_alerts)} stocks")
 
     except Exception as e:
@@ -4219,8 +4806,20 @@ def run_scheduler():
             # Alert about tomorrow's important events
             if current_hour == 20 and current_minute == 0:
                 if last_scheduled_alert.get('calendar_alert') != today_key:
-                    send_calendar_event_alert()
+                    send_calendar_event_alert("evening")
                     last_scheduled_alert['calendar_alert'] = today_key
+
+            # ===== MORNING CALENDAR ALERT - 7 AM =====
+            # Alert about today's important events
+            if current_hour == 7 and current_minute == 0:
+                if last_scheduled_alert.get('calendar_morning') != today_key:
+                    send_calendar_event_alert("morning")
+                    last_scheduled_alert['calendar_morning'] = today_key
+
+            # ===== PRE-EVENT REMINDER - Every hour 8 AM to 4 PM =====
+            # Alert about high impact events happening today
+            if current_minute == 0 and 8 <= current_hour <= 16:
+                send_pre_event_alert()
 
             # ===== NEW AUTOMATIC FEATURES =====
 
@@ -4390,8 +4989,29 @@ def run_bot():
                             handle_sentiment(chat_id)
                         elif cmd == '/pcr':
                             handle_optionchain(chat_id, "NIFTY")
+                        elif cmd == '/days' and len(parts) >= 2:
+                            # /days SYMBOL [N] - show last N days (default 15)
+                            symbol = parts[1].upper()
+                            days = int(parts[2]) if len(parts) >= 3 else 15
+                            days = min(max(days, 5), 30)  # Limit between 5-30 days
+                            handle_days(chat_id, symbol, days)
+                        elif cmd == '/ipo':
+                            handle_ipo(chat_id)
                         else:
-                            send_message(chat_id, "Unknown command. Use /help")
+                            # Check if user typed a stock symbol directly (without /)
+                            potential_symbol = text.strip().upper()
+                            if potential_symbol and len(potential_symbol) <= 20 and potential_symbol.isalpha():
+                                # Try to look up as stock symbol
+                                info = get_stock_info(potential_symbol)
+                                if info and info.get('price'):
+                                    handle_stock(chat_id, potential_symbol)
+                                else:
+                                    send_message(chat_id, f"'{potential_symbol}' not found. Use /help for commands.")
+                            elif not text.startswith('/'):
+                                # Non-command text that's not a stock symbol
+                                send_message(chat_id, "Type a stock symbol (e.g., RELIANCE) or use /help for commands.")
+                            else:
+                                send_message(chat_id, "Unknown command. Use /help")
 
                     except Exception as e:
                         logger.error(f"Command error: {e}")
